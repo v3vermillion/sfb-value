@@ -127,9 +127,13 @@ html[data-kb] .main, html[data-kb] .results, html[data-kb] .sheet-inner { touch-
 html { height: 100%; background: var(--bg); -webkit-text-size-adjust: 100%; text-size-adjust: 100%; scrollbar-gutter: stable;
   /* the page never bounces: on iOS a rubber-band of the page drags the fixed header and search bar with it. Only the
      root element's value reaches the viewport (body's does not propagate); the lists keep their own scrolling */
-  overscroll-behavior: none;
-  /* a control focused by keyboard is scrolled clear of the fixed header and dock */
-  scroll-padding-top: calc(var(--top-h) + var(--banner-h) + 8px); scroll-padding-bottom: calc(var(--dock-h) + var(--kb) + 8px); }
+  overscroll-behavior: none; }
+/* No scroll-padding on the root. The page itself never scrolls (both panels are fixed scrollers between the header and
+   the dock, so a focused row is never under either), and WebKit grows every reveal through the document by the root's
+   scroll-padding, including the reveal its selection autoscroll makes, every 50 ms, for the finger's own point during a
+   caret drag in the search box. With the keyboard's height in that padding the reveal asked for more room than the
+   keyboard leaves, and iOS panned the page by all of it, over and over against the app's undo (owner's recording,
+   2026-10-23; keyboard-check S12 computes that reveal from the root's computed style and fails if padding comes back). */
 /* no orphaned last words in headings and short paragraphs */
 h1, h2, h3, .he-sub, .stale-text { text-wrap: balance; }
 /* body copy fills its measure; pretty only keeps a last word from standing alone (balance left the walkthrough text ragged) */
