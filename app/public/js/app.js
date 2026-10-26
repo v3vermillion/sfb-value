@@ -1289,8 +1289,20 @@ el.tallySheet.addEventListener("click", (e) => {
 });
 async function shareTally() {
   const total = tallyTotal();
-  const lines = tally.map((t) => `${t.unit === "lb" ? `${fmtNum(t.qty)} lb` : `${t.qty}×`} ${t.title} — ${money(t.cents)}`);
-  const text = `Strongsville Emergency Food Bank · Donation value · ${new Date().toLocaleDateString()}\n${lines.join("\n")}\nTotal: ${money(total)} (${itemsText(tallyCount())})\nPrice list updated ${fmtDate(priceDate(), true)}\n1 John 4:19`;
+  // Plain text that pastes cleanly into Messages, Mail, Notes and any Android app: short header lines,
+  // one bulleted line per item (a wrapped title still reads as one item), blank lines between blocks.
+  const lines = tally.map((t) => `• ${t.unit === "lb" ? `${fmtNum(t.qty)} lb` : `${t.qty}×`} ${t.title} — ${money(t.cents)}`);
+  const today = new Date().toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+  const text = [
+    "Strongsville Emergency Food Bank",
+    `Donation value · ${today}`,
+    "",
+    ...lines,
+    "",
+    `Total: ${money(total)} (${itemsText(tallyCount())})`,
+    "",
+    `Price list updated ${fmtDate(priceDate(), true)}`,
+  ].join("\n");
   try {
     if (navigator.share) await navigator.share({ title: "Donation value", text });
     else { await navigator.clipboard.writeText(text); toast("Tally copied to the clipboard"); }
