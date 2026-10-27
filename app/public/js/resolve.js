@@ -79,8 +79,12 @@ export function storeOfCode(gtin14, prefixes) {
 }
 
 /** Resolution from a search hit the volunteer tapped (or the listing a barcode found). otherBrand: the other chain's
- * store brand the query named (the item is Walmart's equivalent); learned: a match remembered on this phone. */
+ * store brand the query named (the item is Walmart's equivalent); learned: a match remembered on this phone.
+ * An item with a value-brand equivalent (item.gv, from the worker) is valued at it: Great Value's price for the same
+ * product, scaled to the item's size (owner, 2026-10-26); the item's own Walmart price stays on the resolution as
+ * gv.ownCents, and useOwn() switches to it when the volunteer says the equivalent is not the same product. */
 export function fromItem(item, { closest = false, query = "", dropped = [], otherBrand = null, learned = null } = {}) {
+  if (item.gv) return valueAt(fromItem({ ...item, gv: undefined, priceWithheld: false }, { closest, query, dropped, otherBrand, learned }), item, false);
   if (item.priceWithheld) {
     // Walmart's own price for this listing is implausible (data/gates.json price_sanity): the snapshot values it at an
     // equivalent instead, so the volunteer still gets a sensible value and sees where it came from
@@ -105,6 +109,16 @@ export function fromItem(item, { closest = false, query = "", dropped = [], othe
     // alternate the sheet offers (a volunteer may hold the whole bundle)
     ...(item.packListing && item.listingCents > 0 && item.listingPack > 1 ? { listing: { cents: item.listingCents, n: item.listingPack } } : {}),
   };
+}
+
+/** A resolution of an item with a value-brand equivalent, valued at the equivalent (own = false) or at the item's own
+ * Walmart price (own = true). The bundle alternate of a "(N pack)" listing follows: N times the unit's value. */
+export function valueAt(res, item, own) {
+  const g = item.gv;
+  const cents = own ? g.ownCents : g.cents;
+  const out = { ...res, item, gv: g, useOwn: own, priceCents: cents, unitCents: null, packOne: false, packListing: false };
+  if (res.listing) out.listing = { ...res.listing, cents: own ? item.listingCents : g.cents * res.listing.n };
+  return out;
 }
 
 // Walmart's bundle listings start with "(N pack)" / "(N pk)" / "(N-Pack)" and are priced for all N units (the crawler's
@@ -197,7 +211,15 @@ export async function resolveCode(db, raw, format, { scanned = false, preferId =
   if (r?.equivalent) {
     const e = r.equivalent;
     const title = titleOf({ brand: e.brand, name: e.name }) + (e.quantity ? `, ${e.quantity}` : "");   // the brand once
-    return { kind: "equivalent", code: cls.digits, gtin, equiv: e, priceCents: e.estCents, unit: "each", title, key: `e:${gtin}`, scanned: cls };
+    // the Walmart item it was valued from has a value-brand equivalent: the estimate moves to that price level, as every
+    // item's value does (another chain's store brand is already at it: storeTier)
+    const b = e.basis;
+    let priceCents = e.estCents, gv = null;
+    if (!e.storeTier && b?.gv && b.priceCents > 0 && e.estCents > 0) {
+      const cents = Math.round((e.estCents * b.gv.cents) / b.priceCents);
+      if (cents > 0 && cents < e.estCents) { priceCents = cents; gv = { ...b.gv, cents, ownCents: e.estCents, viaBasis: true }; }
+    }
+    return { kind: "equivalent", code: cls.digits, gtin, equiv: e, priceCents, ...(gv ? { gv } : {}), unit: "each", title, key: `e:${gtin}`, scanned: cls };
   }
   // a barcode this phone matched before (a search by name, added to the tally): the same Walmart item, by its own barcode
   const mem = typeof learned === "function" ? learned(cls.gtin14) : learned?.[cls.gtin14];
@@ -252,6 +274,15 @@ export function pruneOwnMatches(learned, max) {
 export function notesFor(res, ctx = {}) {
   const notes = [];
   const it = res.item;
+  if (res.gv) {
+    const g = res.gv, b = g.basis;
+    const per = b?.unit === "ct" ? "count" : "ounce";
+    if (res.useOwn) notes.push({ tone: "", text: `Valued at this item's own Walmart price, as chosen. Its ${g.brand} equivalent, ${titleOf(b)}, would be ${moneyText(g.cents)}.` });
+    else if (g.viaBasis) notes.push({ tone: "equiv", text: `Valued at the ${g.brand} price level of the Walmart item it was compared with (${moneyText(g.ownCents)} at that item's own price).` });
+    else notes.push({ tone: "equiv", text: `Valued at its ${g.brand} equivalent, ${titleOf(b)}${g.scaled ? `, priced by the ${per} for this item's size` : ""}. This brand's own Walmart price is ${moneyText(g.ownCents)}.` });
+  } else if (it?.gvNone && (res.kind === "exact" || res.kind === "closest")) {
+    notes.push({ tone: "", text: "Walmart sells no close equivalent under its own value brands (Great Value, Equate and the like), so this item's own Walmart price is used." });
+  }
   if (res.otherBrand) {
     notes.push({ tone: "equiv", text: `${res.otherBrand.brand} is ${whoseBrand(res.otherBrand)}, which Walmart does not sell. This Walmart item is its equivalent, and Walmart's own brand is the same price tier.` });
   }

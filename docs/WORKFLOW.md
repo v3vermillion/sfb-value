@@ -67,5 +67,10 @@ this order of priority:
 5. **Live check**: when the phone is online, an unknown barcode is priced through the Worker; a live price above the
    list's ceiling (one figure for every item, the higher department ceiling: $150; the pack manifest's `priceCeiling`) is not believed.
 6. **Last resort**: the same product type at the same size, per unit, flagged. Never blank, never unpriced.
+7. **Valued at Walmart's value brand** (decision 2026-10-27): whatever the item resolved to, a name brand is valued at
+   its Great Value (Equate, Parent's Choice, ...) equivalent: the same kind of item, at the nearest size, priced by the
+   ounce or count for the item's size (app/public/js/db-worker.js `valueEquivalent`; the value brands and the generic
+   words of brand-name products in `data/brands.json`). The sheet names the value item and the brand's own price, and
+   one tap values the item at its own price instead. With no close equivalent, the item's own Walmart price is used.
 
 Used goods show the new retail price; whether to adjust for condition is food-bank policy.

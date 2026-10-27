@@ -406,8 +406,10 @@ const manifest = {
         for (const name of d.brands || []) brands[String(name).toLowerCase()] = store;
         for (const p of d.prefixes || []) prefixes[String(p)] = { store, brand: title((d.brands || [store])[0]) };
       }
-      return { brands, prefixes };
-    } catch { return { brands: {}, prefixes: {} }; }
+      // Walmart's value brands and the generic words of brand-name products: every item is valued at its value-brand
+      // equivalent (db-worker valueEquivalent; owner, 2026-10-26)
+      return { brands, prefixes, valueBrands: b.walmart_value_brands || null, genericNames: b.generic_names || null };
+    } catch { return { brands: {}, prefixes: {}, valueBrands: null, genericNames: null }; }
   })(),
   priceCeiling: Math.round(100 * Math.max(Number(catCfg.consumable_rules?.max_price) || 0, Number(catCfg.durable_rules?.max_price) || 0)) || null,
   store: (() => { try { const s = JSON.parse(fs.readFileSync(STORE_FILE, "utf8")); return { id: s.store_id, name: s.name, address: s.address, label: s.label || "Strongsville Walmart" }; } catch { return null; } })(),

@@ -190,7 +190,8 @@ function warm() {
   if (!db) return;
   const jobs = [];
   for (const S of db.shards) if (S && !S.warmed) { S.warmed = true; for (const c of "abcdefghijklmnopqrstuvwxyz0123456789") jobs.push([S, c]); }
-  const step = () => { if (!db || !jobs.length) return; const [S, c] = jobs.shift(); prefixBits(S, c); setTimeout(step, 0); };
+  for (const S of db.shards) if (S && S.tier !== "more") jobs.push([S, null]);       // the value-brand index of the core shards
+  const step = () => { if (!db || !jobs.length) return; const [S, c] = jobs.shift(); if (c === null) gvIndex(S); else prefixBits(S, c); setTimeout(step, 0); };
   step();
 }
 
@@ -277,6 +278,267 @@ function lookupPlu(code) {
   if (!c) return null;
   const g = c.rank == null ? null : c.shard != null ? gidOf(c.shard, c.rank) : c.rank;
   return { ...c, item: g != null ? item(g) : null };
+}
+
+// ---------------------------------------------------------------- value-brand equivalent
+// Every donated item is valued at Walmart's own value brand's version of it (owner, 2026-10-26): a box of Barilla rigatoni
+// is worth what Great Value Rigatoni costs, scaled to the box's size. The value brands come from data/brands.json via the
+// manifest (Great Value, Equate, Parent's Choice, ...; Walmart's premium lines such as Sam's Choice are not the same tier).
+// The equivalent is the value-brand item of the same category whose name the donated item's name explains best (its own
+// words found in the donated item's, the same kind of thing), at the nearest size; its price per ounce, fluid ounce or
+// count is scaled to the donated item's size. None when the item is a value brand itself, a durable good, sold by the
+// pound, has no stated size, when nothing matches closely enough, or when the equivalent would cost more than the item's
+// own Walmart price (a wrong match more often than a real one): the item's own Walmart price is then its value.
+const VALUE_BRANDS_DEFAULT = ["great value", "equate", "parent's choice", "ol' roy", "special kitty", "mainstays", "marketside",
+  "freshness guaranteed", "clear american", "spring valley"];
+const brandKey = (b) => String(b || "").toLowerCase().replace(/['’`]/g, "").trim();
+const MEASURE_OF = { oz: ["oz", 1], lb: ["oz", 16], g: ["oz", 0.035274], kg: ["oz", 35.274], "fl oz": ["oz", 1], ml: ["oz", 0.033814],
+  l: ["oz", 33.814], gal: ["oz", 128], qt: ["oz", 32], pt: ["oz", 16], ct: ["ct", 1] };   // ounces and fluid ounces compare loosely, as identify.py does
+// words that say nothing about what the item is: marketing, certification, packaging
+const GV_NOISE = new Set(["great", "value", "brand", "new", "classic", "original", "non", "gmo", "kosher", "certified", "shelf", "stable",
+  "premium", "quality", "resealable", "canister", "family", "size", "per", "made", "real", "all", "natural", "naturally", "delicious",
+  "percent", "100", "usa", "free", "flavored", "flavor", "pantry", "staple", "staples", "ready", "eat", "serve", "contains", "net", "wt",
+  "approx", "approximately", "multipack", "multi", "variety", "assorted", "bulk", "value", "pk", "fl", "jumbo", "mega", "pack", "packs",
+  "count", "ct", "box", "bag", "can", "cans", "jar", "bottle", "bottles", "tub", "pouch", "carton", "container",
+  "easy", "open", "fully", "cooked", "frozen"]);
+// "free" alone is noise, but "gluten free", "sugar free", "low sodium", "reduced fat" and their kin are the variant: kept
+// as one word ("glutenfree", "lowsodium"), and so is a diaper or clothing size ("size 4" -> "size4")
+const FREE_OF = new Set(["gluten", "sugar", "fat", "dairy", "caffeine", "salt", "sodium", "lactose", "fragrance", "dye", "alcohol", "nut", "egg", "soy", "carb", "calorie", "fluoride", "paraben", "sulfate"]);
+const LESS = new Set(["low", "reduced", "less", "no", "lower"]);
+// words that must agree: when the value item says it (decaf, sugar free, organic, for cats, size 4), the donated item says
+// it too, or the value item is a different product (regular oats are not the gluten-free ones, dog food is not cat food)
+const MUST_AGREE = /^(organic|decaf|decaffeinated|diet|zero|unsweetened|lite|kid|kids|toddler|infant|baby|puppy|kitten|dog|cat|men|women|herbal|green|size\d.*|stage\d|.+free|(low|reduced|less|no|lower)[a-z]+)$/;
+const sing = (t) => (t.length > 3 && t.endsWith("ies") ? t.slice(0, -3) + "y" : t.length > 3 && t.endsWith("s") && !t.endsWith("ss") ? t.slice(0, -1) : t);
+function gvWords(it, generic = null) {
+  const brandToks = new Set(tokenize(it.brand));
+  const toks = tokenize(it.name);
+  const out = new Set();
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i], next = toks[i + 1];
+    if (t === "free" && i > 0 && FREE_OF.has(toks[i - 1])) { out.add(toks[i - 1] + "free"); out.delete(sing(toks[i - 1])); continue; }
+    if (LESS.has(t) && FREE_OF.has(next)) { out.add(t + next); i++; continue; }
+    if (t === "size" && /^(\d+|n|nb|newborn|preemie)$/.test(next || "")) { out.add("size" + next); i++; continue; }
+    if (t === "stage" && /^\d$/.test(next || "")) { out.add("stage" + next); i++; continue; }        // baby food stages
+    if (/^diapers?$/.test(t) && /^\d$/.test(next || "")) { out.add("diaper"); out.add("size" + next); i++; continue; }   // "Diapers 4 22-37 lbs"
+    if (/^\d/.test(t) || t.length < 2 || UNIT_WORDS.has(t) || GV_NOISE.has(t) || brandToks.has(t)) continue;
+    out.add(sing(t));
+  }
+  // a brand that is the product's name ("Cheerios", "Kool-Aid", "Q-tips"): the generic words it stands for
+  // (data/brands.json generic_names, via the manifest)
+  if (generic?.length) {
+    const all = [...brandToks, ...toks];
+    const hasRun = (run) => { for (let i = 0; i + run.length <= all.length; i++) if (run.every((x, k) => all[i + k] === x)) return true; return false; };
+    // the longest name first; a shorter one inside it is the same product ("honey nut cheerios", not also "cheerios")
+    const hit = [];
+    for (const g of generic) {
+      if (!hasRun(g.toks) || hit.some((h) => h.toks.join(" ").includes(g.toks.join(" ")))) continue;
+      hit.push(g);
+      for (const w of g.words) out.add(w);
+      out.genericHead ||= g.words[g.words.length - 1];
+    }
+  }
+  return out;
+}
+function genericNames() {
+  if (!db.genericNames) {
+    const src = db.manifest?.genericNames || {};
+    db.genericNames = Object.entries(src).map(([k, v]) => ({ toks: tokenize(k), words: [...new Set(tokenize(v).map(sing))] }))
+      .filter((g) => g.toks.length && g.words.length).sort((a, b) => b.toks.length - a.toks.length);
+  }
+  return db.genericNames;
+}
+function valueBrandSet() {
+  if (!db.valueBrands) db.valueBrands = new Set((db.manifest?.valueBrands || VALUE_BRANDS_DEFAULT).map(brandKey));
+  return db.valueBrands;
+}
+// what a listing is, for this comparison: the head noun after a leading brand ("Quaker, Quick 1 Minute Oats" is oats) and
+// before an "in water", "in juice" ("Chunk Light Tuna in Water" is tuna)
+function gvHead(it) {
+  let name = String(it.name).split(/\s+in\s+/i)[0];
+  const b = String(it.brand || "").trim();
+  if (b && name.toLowerCase().startsWith(b.toLowerCase())) name = name.slice(b.length).replace(/^[\s,:;-]+/, "") || name;
+  return sing(headNoun(name) || "");
+}
+/** A donated item's possible head nouns: the head of each part of its name between commas or dashes, marketing words
+ * aside ("Barilla Classic Non-GMO, Kosher Certified Rigatoni Pasta, 16 oz" is pasta, not "gmo"). The first is its own. */
+function gvHeads(it, words) {
+  const first = gvHead(it);
+  const out = first ? [first] : [];
+  for (const part of String(it.name).split(/,| - | – | \| /).slice(1)) {
+    const h = sing(headNoun(part.split(/\s+in\s+/i)[0]) || "");
+    if (h && !GV_NOISE.has(h) && words.has(h) && !out.includes(h)) out.push(h);
+  }
+  return out;
+}
+// a listing that is two products, or one with a gift ("Bundle and Save!", "+ Free Pampers Sensitive Wipes", "FREE Holiday
+// Stocking Toy with your purchase of"): never compared
+const BUNDLED_RX = /\bbundle\b|\+\s*free\b|\bfree\b[^,]*\bwith\b|\bwith (?:your )?purchase\b|\bbuy\b[^,]*\bsave\b/i;
+// what a donated item's name may say it is when it shares only one word with the value item: a class of products, so
+// "Barilla Collezione Rigatoni Pasta" is Great Value Rigatoni, while "Milk Chocolate Caramel Squares" are not Caramels
+const CLASS_WORDS = new Set(["pasta", "cereal", "soup", "snack", "food", "drink", "beverage", "candy", "treat", "dessert",
+  "meal", "dinner", "side", "seasoning", "spice", "mix", "vegetable", "fruit", "cleaner", "medicine", "supplement", "vitamin"]);
+// what a value brand's name leaves unsaid: Special Kitty is cat food, Ol' Roy dog food
+const BRAND_SAYS = { "special kitty": "cat", "ol roy": "dog" };
+// sold by what it holds, not by its content: a 9 oz cup or a 2 gallon bag is not 9 ounces of anything (Kitchen & Dining,
+// and these items wherever they are filed)
+const CAPACITY_HEADS = new Set(["cup", "tumbler", "mug", "glass", "plate", "bowl", "container", "lid", "bottle", "jar", "pitcher", "tray", "pan", "set"]);
+const CAPACITY_CATS = new Set([17]);
+const isValueBrand = (it) => !!it && it.storeBrand && valueBrandSet().has(brandKey(it.brand));
+// a listing's quantity per piece in ounces (weight and volume alike) or count, and its pieces: [measure, qty, pieces]
+function gvQty(it) {
+  const m = MEASURE_OF[it.unit];
+  if (!m || !(it.size > 0)) return null;
+  return [m[0], it.size * m[1], it.pack > 1 ? it.pack : 1];
+}
+/** The value-brand items of a core shard, built on first use: by category, and by category and word. */
+function gvIndex(S) {
+  const vb = valueBrandSet();
+  if (S.gv && S.gv.brands === vb) return S.gv;      // a shard kept across versions is re-indexed when the brand list is new
+  const byCat = new Map(), byWord = new Map();
+  if (S.tier !== "more") {
+    for (let r = 0; r < S.N; r++) {
+      if (!(S.flags[r] & F.STORE_BRAND) || (S.flags[r] & F.RETIRED) || (S.flags2[r] & (F2.PLACEHOLDER | F2.PRICE_WITHHELD | F2.UNIT_SUSPECT)) || S.basis[r] || !S.price[r]) continue;
+      const txt = itemText(S, r), sep = txt.indexOf("\x1F");
+      if (!vb.has(brandKey(txt.slice(0, sep)))) continue;
+      const it = { brand: txt.slice(0, sep), name: txt.slice(sep + 1), size: S.size[r], unit: UNIT_NAME[S.unit[r]], pack: S.pack[r] };
+      const q = gvQty(it);
+      // a count in the name beside a weight ("15 oz Can, 4 Count", "26.4 oz, 12 Count") may be per piece or for the whole
+      // box: such a listing never sets a value-brand price
+      if (!q || (q[0] !== "ct" && q[2] === 1 && piecesOf(S, r, it.name) > 1) || BUNDLED_RX.test(it.name)) continue;
+      const words = gvWords(it);
+      if (!words.size) continue;
+      const says = BRAND_SAYS[brandKey(it.brand)];
+      if (says) words.add(says);
+      const e = { r, cat: S.cat[r], q, words, head: gvHead(it), price: S.price[r] };
+      if (CAPACITY_CATS.has(e.cat) || CAPACITY_HEADS.has(e.head)) continue;
+      if (!byCat.has(e.cat)) byCat.set(e.cat, []);
+      byCat.get(e.cat).push(e);
+      for (const w of words) { const k = e.cat + "|" + w; if (!byWord.has(k)) byWord.set(k, []); byWord.get(k).push(e); }
+    }
+  }
+  S.gv = { byCat, byWord, brands: vb };
+  return S.gv;
+}
+/** How many value-brand items of each category carry each word (all loaded core shards): a rare word ("magnesium",
+ * "worcestershire") says more about what an item is than a common one ("powder", "sauce"). */
+function gvStats() {
+  const key = db.shards.filter((S) => S && S.tier !== "more").map((S) => S.key).join("|");
+  if (db.gvStats?.key === key) return db.gvStats;
+  const df = new Map(), n = new Map();
+  for (const S of db.shards) {
+    if (!S || S.tier === "more") continue;
+    for (const [cat, list] of gvIndex(S).byCat) {
+      n.set(cat, (n.get(cat) || 0) + list.length);
+      for (const e of list) for (const w of e.words) df.set(cat + "|" + w, (df.get(cat + "|" + w) || 0) + 1);
+    }
+  }
+  db.gvStats = { key, idf: (cat, w) => Math.log(1 + (n.get(cat) || 1) / (df.get(cat + "|" + w) || 1)) };
+  return db.gvStats;
+}
+const GV_RANK_BONUS = 1.2;    // search: a value-brand item that is what the query names (measured on the gold set: no query lost)
+const GV_MIN_COVER = 0.6;     // at least this share of the value item's own words are in the donated item's name
+const GV_MARGIN = 0.25;       // candidates this close to the best score compete on size
+const GV_MAX_SCALE = 4;       // a value item at most 4x larger or smaller per piece than the donated one
+/** The value-brand equivalent of an item (from itemOf), or null; marks it.gvNone when one was looked for and not found.
+ * debug: an array that collects every candidate with the reason it was kept or set aside (tools only). */
+function valueEquivalent(it, debug = null) {
+  if (!it || it.priceCents == null || !it.priceCents || it.basis === "lb" || it.placeholder || isValueBrand(it)) return null;
+  const [si] = splitGid(it.rank);
+  if (!db.shards[si] || db.shards[si].tier === "more") return null;
+  const q = gvQty(it);
+  const words = gvWords(it, genericNames());
+  // what the item is: the generic name's last word for a brand-name product ("Dog Chow" is dog *food*), else its head noun
+  const heads = words.genericHead ? [words.genericHead] : gvHeads(it, words);
+  const head = heads[0] || "";
+  if (!q || !words.size || BUNDLED_RX.test(it.name) || CAPACITY_CATS.has(it.cat) || heads.some((h) => CAPACITY_HEADS.has(h))) { it.gvNone = true; return null; }
+  const { idf } = gvStats();
+  // how much one listing holds: "15 oz, 6 Count" is six 15 oz cans, "26.4 oz, 12 Count" a 26.4 oz box of 12 bars; the
+  // name does not say which, so both readings are tried and the one priced like a value brand against this item wins
+  const n = it.pieces > 1 && !(it.pack > 1) && q[0] !== "ct" ? it.pieces : 0;
+  const readings = n ? [[q[1], n], [q[1] / n, n], [q[1], 1]] : [[q[1], q[2]]];
+  const cands = [];
+  const seen = new Set();
+  for (const S of db.shards) {
+    if (!S || S.tier === "more") continue;
+    const { byWord } = gvIndex(S);
+    for (const w of words) {
+      for (const e of byWord.get(it.cat + "|" + w) || []) {
+        if (seen.has(e) || e.q[0] !== q[0]) continue;
+        seen.add(e);
+        let both = 0, clash = null, wBoth = 0, wAll = 0;
+        for (const x of e.words) {
+          const w = idf(e.cat, x);
+          wAll += w;
+          if (words.has(x)) { both++; wBoth += w; } else if (MUST_AGREE.test(x)) clash = x;
+        }
+        // the share of the value item's own words found in the donated item's name, each word weighted by how rare it is
+        const cover = wAll ? wBoth / wAll : 0;
+        const sameHead = heads.includes(e.head);
+        // the same kind of thing: the same head noun, or each item's head noun in the other's name, or the value item's head
+        // noun in the donated item's name when the donated item's own is only a class ("Barilla Collezione Rigatoni Pasta"
+        // is Great Value Rigatoni; "KIND Almond Butter Dark Chocolate Bars" are not Great Value Dark Chocolate with
+        // Almonds, nor a "Baby Eau De Parfum Spray" an Equate Baby Sunscreen Spray); most of the value item's words (two fifths for the same noun: "Colgate Total
+        // Whitening Toothpaste" is an Equate toothpaste); and one word in common only when it is all one of them says
+        // ("Rummo Rigatoni", "StarKist Tuna"; not "Hell Fire Hot Sauce" for Great Value Worcestershire Sauce)
+        const kind = sameHead || (words.has(e.head) && heads.some((h) => e.words.has(h) || CLASS_WORDS.has(h)));
+        const why = clash ? `says ${clash}` : !kind ? "another kind of item"
+          : !(cover >= GV_MIN_COVER || (sameHead && cover >= 0.4)) ? `cover ${cover.toFixed(2)}`
+          : both < 2 && e.words.size > 1 && words.size > 1 ? "one word in common" : "";
+        if (debug) debug.push({ name: itemText(S, e.r).replace("\x1F", " · "), why: why || "ok", cover: +cover.toFixed(2) });
+        if (why) continue;
+        cands.push({ e, S, score: cover + 0.5 * (both / words.size) + (sameHead ? 0.1 : 0) });
+      }
+    }
+  }
+  let pick = null;
+  for (const [per, pieces] of readings) {
+    const scored = cands.map((c) => ({ ...c, scale: per / c.e.q[1] })).filter((c) => c.scale <= GV_MAX_SCALE && c.scale >= 1 / GV_MAX_SCALE);
+    if (!scored.length) continue;
+    const best = Math.max(...scored.map((c) => c.score));
+    const near = scored.filter((c) => c.score >= best - GV_MARGIN)
+      .sort((a, b) => Math.abs(Math.log(a.scale)) - Math.abs(Math.log(b.scale)) || b.score - a.score || a.e.r - b.e.r);
+    // one listing never sets the value alone (a 144-count box of diapers listed at $6.00): the median price per ounce or
+    // per count of the closest wordings between half and twice the size (the nearest size alone when none is), and a
+    // listing of the same size is its value when its own price agrees with that median within a third
+    const unit = (c) => c.e.price / c.e.q[2] / c.e.q[1];
+    // (the best-worded of them: an organic soup is priced from the organic ones)
+    const close = near.filter((c) => c.scale >= 0.5 && c.scale <= 2);
+    const top = Math.max(...close.map((c) => c.score));
+    const pool = close.length ? close.filter((c) => c.score >= top - 0.1) : near.slice(0, 1);
+    const ups = pool.map(unit).sort((a, b) => a - b);
+    const med = ups.length % 2 ? ups[ups.length >> 1] : (ups[ups.length / 2 - 1] + ups[ups.length / 2]) / 2;
+    const same = pool.find((c) => Math.abs(c.scale - 1) <= 0.02 && Math.abs(unit(c) / med - 1) <= 0.34);
+    const basis = same || pool.slice().sort((a, b) => Math.abs(unit(a) - med) - Math.abs(unit(b) - med) || a.e.r - b.e.r)[0];
+    const cents = Math.round(same ? (same.e.price / same.e.q[2]) * pieces : med * per * pieces);
+    // never above the item's own Walmart price, nor under a fifth of it (a wrong reading or match, or a mispriced
+    // listing, more often than a real price); of the readings, the one nearest the measured value-brand price level
+    // (0.57 of a national brand per unit, 2026-10-26)
+    if (!(cents > 0) || cents > it.priceCents || cents < 0.2 * it.priceCents) continue;
+    const fit = Math.abs(Math.log(cents / it.priceCents / 0.57));
+    if (!pick || fit < pick.fit) pick = { c: basis, cents, sameSize: !!same, fit, n: pool.length };
+  }
+  if (!pick) { it.gvNone = true; return null; }
+  const basis = itemOf(pick.c.S, pick.c.e.r, false);
+  // scaled: the value is not the basis listing's own price but the per-unit price of the value brand's similar sizes
+  // times this item's size (the sheet says so)
+  return { cents: pick.cents, ownCents: it.priceCents, brand: basis.brand, basis, scaled: !pick.sameSize, compared: pick.n, confidence: pick.c.score >= 1.1 ? "high" : "medium" };
+}
+/** An item as the app sees it: with its value-brand equivalent when it has one. Successive keystrokes show mostly the
+ * same items, so each item's answer is kept (per pack version) and a keystroke only works out the new ones. */
+const gvCache = new Map();
+function withValue(it) {
+  if (!it || it.gv !== undefined) return it;
+  const key = `${db.version}:${it.rank}`;
+  let hit = gvCache.get(key);
+  if (!hit) {
+    const gv = valueEquivalent(it);
+    hit = { gv, none: !!it.gvNone };
+    if (gvCache.size > 5000) gvCache.clear();
+    gvCache.set(key, hit);
+  }
+  if (hit.gv) it.gv = hit.gv;
+  if (hit.none) it.gvNone = true;
+  return it;
 }
 
 // ---------------------------------------------------------------- search, per shard
@@ -473,7 +735,10 @@ function scoreCandidates(S, ranks, qTokens, groups, typed = null, ownBrandFirst 
     // for the item the query names, among the consumable departments other chains' store brands compete in ("giant eagle
     // pumpkin" is canned pumpkin, not Mainstays pumpkin plates; owner's food-bank photos, 2026-10-21)
     // (or carries every word: "giant eagle honey nut toasted oats" is Great Value Honey Nut Toasted Oats Cereal)
-    if (it.storeBrand) s += ownBrandFirst && (headHit || exact === groups.length) && S.tier !== "more" ? 3 : 0.3;
+    // and every item is valued at Walmart's value brand (owner, 2026-10-26): a query that names no brand ("rigatoni 16
+    // oz") shows the value brand's item first when it is the item named, so the volunteer sees the price that counts
+    if (it.storeBrand) s += ownBrandFirst && (headHit || exact === groups.length) && S.tier !== "more" ? 3
+      : (headHit || exact === groups.length) && S.tier !== "more" && isValueBrand(it) ? GV_RANK_BONUS : 0.3;
     const aud = AUDIENCE_CATS.get(it.cat);
     if (aud && !qTokens.some((t) => aud.test(t)) && !namesBrand(groups[0])) s -= 2.5;
     if (it.retired) s -= 1.5;
@@ -710,17 +975,26 @@ function sizesOf(g, limit = 8) {
   return out.slice(0, limit).map((x) => x.it).sort((a, b) => a.pieces - b.pieces || (qty(a) || 0) - (qty(b) || 0));
 }
 
+// ---------------------------------------------------------------- what the app asks for: items with their value-brand equivalent
+function searchValued(q, limit) { const r = search(q, limit); r.items = r.items.map(withValue); return r; }
+const itemValued = (g) => withValue(item(g));
+const lookupUpcValued = (key) => lookupUpc(key).map(withValue);
+function lookupEquivalentValued(key) { const e = lookupEquivalent(key); if (e?.basis) withValue(e.basis); return e; }
+const sizesValued = (g, limit) => sizesOf(g, limit).map(withValue);
+/** Tools only: an item's value-brand equivalent with every candidate considered and why it was kept or set aside. */
+function valueDebug(g) { const it = item(g); const candidates = []; const gv = it ? valueEquivalent(it, candidates) : null; return { it, gv, candidates }; }
+
 // ---------------------------------------------------------------- messages
 self.onmessage = async (e) => {
   const m = e.data;
   try {
     switch (m.type) {
       case "load": { const stats = await load(m); postMessage({ type: "ready", id: m.id, stats }); break; }
-      case "search": { postMessage({ type: "result", id: m.id, result: db ? search(m.q, m.limit) : { query: m.q, items: [], notReady: true } }); break; }
-      case "upc": { postMessage({ type: "result", id: m.id, result: db ? { items: lookupUpc(m.key), equivalent: lookupEquivalent(m.key) } : { notReady: true } }); break; }
+      case "search": { postMessage({ type: "result", id: m.id, result: db ? searchValued(m.q, m.limit) : { query: m.q, items: [], notReady: true } }); break; }
+      case "upc": { postMessage({ type: "result", id: m.id, result: db ? { items: lookupUpcValued(m.key), equivalent: lookupEquivalentValued(m.key) } : { notReady: true } }); break; }
       case "plu": { postMessage({ type: "result", id: m.id, result: db ? lookupPlu(m.code) : { notReady: true } }); break; }
-      case "item": { postMessage({ type: "result", id: m.id, result: db ? item(m.rank) : null }); break; }
-      case "sizes": { postMessage({ type: "result", id: m.id, result: db ? sizesOf(m.rank, m.limit) : [] }); break; }
+      case "item": { postMessage({ type: "result", id: m.id, result: db ? itemValued(m.rank) : null }); break; }
+      case "sizes": { postMessage({ type: "result", id: m.id, result: db ? sizesValued(m.rank, m.limit) : [] }); break; }
       case "unload": { db = null; loaded.clear(); tokCache.clear(); postMessage({ type: "result", id: m.id, result: true }); break; }
       default: postMessage({ type: "error", id: m.id, error: "unknown message " + m.type });
     }
@@ -730,4 +1004,4 @@ self.onmessage = async (e) => {
 };
 
 // for tools/search-harness.mjs (Node: tests and the gold search set); a module worker ignores exports
-export { load, search, lookupUpc, lookupEquivalent, lookupPlu, item, sizesOf };
+export { load, searchValued as search, lookupUpcValued as lookupUpc, lookupEquivalentValued as lookupEquivalent, lookupPlu, itemValued as item, sizesValued as sizesOf, valueDebug };

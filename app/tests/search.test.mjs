@@ -71,6 +71,17 @@ const ROWS = [
   // photos 21-22: Costco calls it bath tissue, Walmart's own brand toilet paper
   row("Charmin Ultra Soft Bath Tissue 2-Ply 213 Sheets 30 Rolls", "Charmin", 32.98, { size: 30, unit: "ct", cat: "16", dept: "Household" }),
   row("Great Value Soft & Strong Premium Toilet Paper, 30 Mega Rolls", "Great Value", 18.93, { size: 30, unit: "ct", cat: "16", dept: "Household", store_brand: true }),
+  // every item valued at Walmart's value brand (owner, 2026-10-26): name brands, their value-brand twins, a value-brand
+  // variant that is another product, Walmart's premium own brand, a twin dearer than the item, a dog food beside a cat food
+  row("Barilla Classic Non-GMO Rigatoni Pasta, 16 oz", "Barilla", 1.88, { size: 16, unit: "oz", cat: "7" }),
+  row("Great Value Rigatoni, 16 oz", "Great Value", 1.36, { size: 16, unit: "oz", cat: "7", store_brand: true }),
+  row("Sam's Choice Italia Rigatoni Pasta, 17.6 oz", "Sam's Choice", 3.7, { size: 17.6, unit: "oz", cat: "7", store_brand: true }),
+  row("Ronzoni Rigatoni, 16 oz", "Ronzoni", 1.2, { size: 16, unit: "oz", cat: "7" }),
+  row("Quaker Whole Grain Quick 1-Minute Oats, 18 oz Canister", "Quaker", 4.12, { size: 18, unit: "oz", cat: "29" }),
+  row("Great Value Whole Grain Quick Oats, 42 oz", "Great Value", 4.18, { size: 42, unit: "oz", cat: "29", store_brand: true }),
+  row("Great Value Gluten Free Quick Oats, 18 oz", "Great Value", 3.17, { size: 18, unit: "oz", cat: "29", store_brand: true }),
+  row("Purina Dog Chow Complete Adult Dry Dog Food, 16 lb", "Purina", 14.98, { size: 16, unit: "lb", cat: "19", dept: "Pets" }),
+  row("Special Kitty Complete Nutrition Dry Food, 16 lb", "Special Kitty", 7.48, { size: 16, unit: "lb", cat: "19", dept: "Pets", store_brand: true }),
 ];
 
 let db;
@@ -226,4 +237,36 @@ test("bath tissue is toilet paper: Kirkland's 30 rolls are valued as Walmart's o
   assert.equal(r.otherBrand?.store, "Costco");
   assert.match(r.items[0].name, /^Great Value .*Toilet Paper, 30/);
   assert.ok(top("toilet paper").items.some((x) => /Bath Tissue/.test(x.name)), "and the other way round");
+});
+
+const find = (q, re) => top(q).items.find((x) => re.test(x.name));
+
+test("every item is valued at its value-brand equivalent, scaled to its size (owner, 2026-10-26)", () => {
+  const barilla = find("barilla rigatoni", /^Barilla/);
+  assert.equal(barilla.gv.brand, "Great Value");
+  assert.equal(barilla.gv.basis.name, "Great Value Rigatoni, 16 oz");
+  assert.equal(barilla.gv.cents, 136, "the same size: the value brand's own price");
+  assert.equal(barilla.gv.scaled, false);
+  assert.equal(barilla.gv.ownCents, 188);
+  const quaker = find("quaker quick oats", /^Quaker/);
+  assert.match(quaker.gv.basis.name, /Whole Grain Quick Oats, 42 oz/, "regular oats, not the gluten-free ones");
+  assert.equal(quaker.gv.cents, Math.round((418 / 42) * 18), "priced by the ounce for 18 oz");
+  assert.equal(quaker.gv.scaled, true);
+  assert.equal(find("sams choice rigatoni", /^Sam's Choice/).gv.cents, Math.round((136 / 16) * 17.6), "Walmart's premium line is valued at the value brand too");
+  const gv = find("great value rigatoni", /^Great Value Rigatoni/);
+  assert.equal(gv.gv, undefined); assert.ok(!gv.gvNone, "a value-brand item is its own value");
+});
+
+test("an equivalent is never another product, nor dearer than the item itself", () => {
+  const dog = find("purina dog chow", /^Purina/);
+  assert.equal(dog.gv, undefined, "dog food is not valued as cat food");
+  assert.equal(dog.gvNone, true);
+  const ronzoni = find("ronzoni rigatoni", /^Ronzoni/);
+  assert.equal(ronzoni.gv, undefined, "a twin at $1.36 does not value a $1.20 box");
+  assert.equal(ronzoni.gvNone, true);
+});
+
+test("a query that names no brand shows the value brand's item first; a brand typed is still found", () => {
+  assert.equal(top("rigatoni 16 oz").items[0].name, "Great Value Rigatoni, 16 oz");
+  assert.equal(top("barilla rigatoni").items[0].brand, "Barilla");
 });
