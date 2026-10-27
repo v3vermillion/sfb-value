@@ -103,7 +103,9 @@ jobs:
       - name: Build the pack and the site from the fixture
         run: |
           set -eu
-          node tools/build-db.mjs --store build/fixture-store --out dist/db
+          # every brand searched: the scrolling checks need long result lists, which the 3,000-item fixture has only with
+          # every brand (data/brands.json searches Walmart's brands only; that scope is tested in tests/walmart-search.test.mjs)
+          node tools/build-db.mjs --store build/fixture-store --out dist/db --search all
           node tools/build-site.mjs
       - name: Serve dist
         run: |

@@ -61,7 +61,10 @@ this order of priority:
    basis item shown. A barcode this phone matched before (an unknown one, found by name and added to the tally) opens
    that Walmart item as a remembered match; one under a listed store's company prefix (`data/brands.json`) is named by
    its store ("Kirkland Signature item (Costco)") and the name search starts with that brand.
-4. **Typed search** shows brand, variant, size, pack and price; the volunteer taps the exact one. Another chain's
+4. **Typed search** shows brand, variant, size, pack and price; the volunteer taps the exact one. In this repository
+   (`data/brands.json` `search_scope: "walmart"`, decision 2026-10-27) only Walmart's own brands and unbranded fresh food
+   are searched: "green beans 14.5 oz" lists Walmart's green beans, nearest size first; another brand typed is set aside
+   and named, and a name brand is found by its barcode only. Another chain's
    store brand in the query (Kirkland, Clancy's, Market District, Happy Belly...) is set aside and Walmart's own brand
    ranks first: the same price tier, and the sheet says so.
 5. **Live check**: when the phone is online, an unknown barcode is priced through the Worker; a live price above the

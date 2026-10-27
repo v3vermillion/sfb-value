@@ -96,7 +96,9 @@ before(async () => {
   const eqs = [{ upc: "00196633831439", name: "Energy Drink", brand: "Kirkland", quantity: "12 oz", base_qty: 12, base_unit: "fl oz", pack: 1, est_price: 1.3, basis_id: ROWS[0].id, basis_name: ROWS[0].name, basis_price: ROWS[0].price, basis_count: 6, store_brand_factor: 0.5, confidence: "high", score: 1.1 },
                { upc: "00012345678905", name: "Sparkling Water", brand: "LaCroix", quantity: "12 fl oz", base_qty: 12, base_unit: "fl oz", pack: 1, est_price: 0.8, basis_id: ROWS[0].id, basis_name: ROWS[0].name, basis_price: ROWS[0].price, basis_count: 4, store_brand_factor: null, confidence: "medium", score: 0.8 }];
   fs.writeFileSync(path.join(idn, "equivalents.jsonl.gz"), zlib.gzipSync(eqs.map((e) => JSON.stringify(e)).join("\n") + "\n"));
-  execFileSync(process.execPath, [path.join(APP, "tools", "build-db.mjs"), "--store", path.join(tmp, "store"), "--out", path.join(tmp, "db")], { stdio: "ignore" });
+  // every brand searched (the search scope of the main app; this fork's data/brands.json searches Walmart's brands only,
+  // tested in walmart-search.test.mjs)
+  execFileSync(process.execPath, [path.join(APP, "tools", "build-db.mjs"), "--store", path.join(tmp, "store"), "--out", path.join(tmp, "db"), "--search", "all"], { stdio: "ignore" });
   db = await openPack(path.join(tmp, "db"));
 });
 

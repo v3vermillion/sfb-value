@@ -16,7 +16,10 @@ import { openPack } from "./search-harness.mjs";
 const APP = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i > 0 ? process.argv[i + 1] : d; };
 const dbDir = arg("db", path.join(APP, "dist", "db"));
-const goldFile = arg("gold", path.join(APP, "..", "data", "gold-search.json"));
+// a pack built with the "walmart" search scope (data/brands.json) answers with Walmart's brands only: its gold set expects them
+const scopeOf = () => { try { const c = JSON.parse(fs.readFileSync(path.join(dbDir, "current.json"), "utf8")); return JSON.parse(fs.readFileSync(path.join(dbDir, c.base, "manifest.json"), "utf8")).searchScope; } catch { return null; } };
+const goldFile = arg("gold", path.join(APP, "..", "data", scopeOf() === "walmart" ? "gold-search-walmart.json" : "gold-search.json"));
+const WALMART = new Set((() => { try { return JSON.parse(fs.readFileSync(path.join(APP, "..", "data", "brands.json"), "utf8")).walmart_brands || []; } catch { return []; } })().map((b) => b.toLowerCase().replace(/['’]/g, "")));
 const min = Number(arg("min", "0.95")), block = Number(arg("block", "0.90"));
 
 const TO = { oz: ["oz", 1], lb: ["oz", 16], "fl oz": ["fl oz", 1], g: ["oz", 0.035274], kg: ["oz", 35.274], ml: ["fl oz", 0.033814], l: ["fl oz", 33.814], gal: ["fl oz", 128], qt: ["fl oz", 32], pt: ["fl oz", 16] };
@@ -26,14 +29,17 @@ export function sizeOk(want, it) {
   if (!it.size || !a || !b || a[0] !== b[0]) return false;
   return Math.abs(it.size * a[1] - want[0] * b[1]) / (want[0] * b[1]) <= 0.03;
 }
-export const satisfies = (g, it) => { const t = `${it.brand} ${it.name}`.toLowerCase(); return g.all.every((w) => t.includes(w)) && sizeOk(g.size, it) && (g.cat == null || it.cat === g.cat); };
+export const satisfies = (g, it) => { const t = `${it.brand} ${it.name}`.toLowerCase(); return g.all.every((w) => w.split("|").some((x) => t.includes(x))) && sizeOk(g.size, it) && (g.cat == null || it.cat === g.cat)
+  && (!g.walmart || WALMART.has(String(it.brand || "").toLowerCase().replace(/['’]/g, "")) || FRESH.has(String(it.brand || "").toLowerCase().trim())); };
+// unbranded fresh food is searched beside Walmart's brands (app/tools/build-db.mjs GENERIC_BRANDS)
+const FRESH = new Set(["", "unbranded", "fresh produce", "produce", "fresh", "generic", "walmart", "no brand"]);
 
-const gold = JSON.parse(fs.readFileSync(goldFile, "utf8")).queries;
+const gold = JSON.parse(fs.readFileSync(goldFile, "utf8")).queries.filter((g) => !g.skip);
 const db = await openPack(dbDir);
 // coverage: one pass over the pack's names
 const covered = new Array(gold.length).fill(false);
 for (const r of db.ids()) {
-  const it = db.item(r);
+  const it = db.itemRaw(r);          // names only: no value-brand equivalent worked out for every item of the pack
   if (it.placeholder) continue;
   for (let i = 0; i < gold.length; i++) if (!covered[i] && satisfies(gold[i], it)) covered[i] = true;
 }

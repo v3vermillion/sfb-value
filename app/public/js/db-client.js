@@ -38,7 +38,7 @@ export function fileList(manifest, version) {
     for (const sh of manifest.shards) for (const f of [sh.files.cols, sh.files.upc, sh.files.tokens, ...sh.files.strings]) {
       out.push({ url: DB_ROOT + f.path, bytes: f.gzBytes || f.bytes || 0, shard: sh.id, tier: sh.tier || "core", bucket: FILES_CACHE });
     }
-    for (const f of [manifest.files.equiv, manifest.files.plu]) out.push({ url: DB_ROOT + f.path, bytes: f.gzBytes || f.bytes || 0, shard: null, tier: "core", bucket: CACHE_PREFIX + version });
+    for (const f of [manifest.files.equiv, manifest.files.plu, manifest.files.brands].filter(Boolean)) out.push({ url: DB_ROOT + f.path, bytes: f.gzBytes || f.bytes || 0, shard: null, tier: "core", bucket: CACHE_PREFIX + version });
     return out.sort((a, b) => (a.tier === b.tier ? 0 : a.tier === "core" ? -1 : 1));
   }
   const f = manifest.files;

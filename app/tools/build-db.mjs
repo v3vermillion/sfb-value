@@ -6,7 +6,7 @@
 // Reads  <store>/build/published/{items.jsonl.gz,manifest.json,stats.json} and <store>/identify/equivalents.jsonl.gz
 // Writes <out>/files/<sha>.bin.gz          every shard file, named by its content (immutable, shared across versions)
 //        <out>/<version>/manifest.json     the shard list and file names
-//        <out>/<version>/{equiv.bin.gz, plu.json}
+//        <out>/<version>/{equiv.bin.gz, plu.json, brands.json (search scope "walmart": other brands' names, set aside by typed search)}
 //        <out>/current.json  -> { version, base }
 //
 // Format "sfb-pack" 3: the items are split into SHARDS, one per department (a large one in parts), consumable departments
@@ -30,6 +30,9 @@
 // Shared by all shards, per version:
 //   equiv.bin    "SFBE" u32 E | keys f64[E] sorted | est u32[E] cents | basis u32[E] (shard << 24 | local rank, 0xFFFFFFFF = none) | baseQty f32[E] | pack u16[E] | unit u8[E] | conf u8[E] | offsets u32[E+1] | utf8 "brand\x1Fname\x1Fquantity"
 //   plu.json     codes with their price and the matched item as {shard, rank}
+//   brands.json  { phrases: { "del monte": [category, "what it mostly makes"], ... } } (search scope "walmart" only)
+// Search scope (data/brands.json search_scope, --search walmart|all): "walmart" puts only Walmart's brands and unbranded fresh
+// food in the word index; every other item stays in the pack, found by its barcode only.
 // Items are stored in RANK order within a shard (best candidate first), so the search worker's bitset scan from rank 0
 // yields best-first results without sorting. Format 2 packs (one shard, files under the version folder) still load.
 import crypto from "node:crypto";
@@ -105,8 +108,27 @@ for (const f of [fileURLToPath(import.meta.url), path.join(APP, "public", "js", 
   const parts = jsonlFiles(f);
   packHash.update(parts.length ? Buffer.concat(parts.map((p) => fs.readFileSync(p))) : Buffer.from("none")).update("\n");
 }
+packHash.update(`search ${arg("search", "")}\n`);      // a --search override builds another pack from the same inputs
 const version = `${snapshot}-${packHash.digest("hex").slice(0, 8)}`;
 log(`reading snapshot ${snapshot} from ${pubDir} (pack ${version})`);
+
+// What typed search finds (data/brands.json search_scope; --search overrides): "walmart" indexes only Walmart's own brands,
+// fresh produce and unbranded items sold by weight, and keeps every other item for barcode lookup only (owner, 2026-10-27);
+// "all" indexes every item
+const brandsCfg = (() => { try { return JSON.parse(fs.readFileSync(BRANDS_FILE, "utf8")); } catch { return {}; } })();
+const SEARCH_SCOPE = String(arg("search", brandsCfg.search_scope || "all")) === "walmart" ? "walmart" : "all";
+const brandKey = (b) => String(b || "").toLowerCase().replace(/['’`]/g, "").trim();
+const WALMART_BRANDS = new Set((brandsCfg.walmart_brands || []).map(brandKey));
+// fresh food Walmart sells without a brand: produce, meat, deli and bakery items under a generic name ("Unbranded Organic
+// Bananas", "Fresh Produce"); a branded one (Del Monte, Tyson) is another brand like any other
+const FRESH_CATS = new Set([1, 3, 4, 8]);
+const GENERIC_BRANDS = new Set(["", "unbranded", "fresh produce", "produce", "fresh", "generic", "walmart", "no brand"]);
+const searchable = (brand, cat) => SEARCH_SCOPE === "all" || WALMART_BRANDS.has(brandKey(brand)) || (FRESH_CATS.has(cat) && GENERIC_BRANDS.has(brandKey(brand)));
+let barcodeOnly = 0, leftOut = 0;
+// the other brands' names and the category each mostly sells in ("del monte" canned food, "tide" household supplies): under
+// the "walmart" scope those brands are not searched, so a brand typed with the product ("del monte green beans") is set
+// aside whole and points the search at its aisle (<version>/brands.json)
+const brandPhraseCats = new Map(), brandProducts = new Map();
 
 const items = [];
 for await (const r of jsonlGz(path.join(pubDir, srcManifest.file || "items.jsonl.gz"))) {
@@ -134,6 +156,25 @@ for await (const r of jsonlGz(path.join(pubDir, srcManifest.file || "items.jsonl
   const name = String(r.name || "").trim();
   const brand = String(r.brand || "").trim();
   const upc = gtinNumber(r.upc);
+  const inSearch = searchable(brand, Number(r.cat) || 0);
+  if (!inSearch && !upc) { leftOut++; continue; }          // neither found by a typed search nor by a barcode
+  if (!inSearch) {
+    barcodeOnly++;
+    const c = Number(r.cat) || 0;
+    const phrase = tokenize(brand).join(" ");
+    if (phrase) {
+      let m = brandPhraseCats.get(phrase); if (!m) { m = new Map(); brandPhraseCats.set(phrase, m); } m.set(c, (m.get(c) || 0) + 1);
+      // what the brand mostly makes, as its listings name it: the head noun and the word before it ("tortilla chips")
+      const head = headNoun(name);
+      if (head) {
+        const bt = new Set(tokenize(brand)), t = tokenize(name).filter((x) => !bt.has(x) && !/^\d/.test(x));
+        const at = t.lastIndexOf(head), two = at > 0 ? `${t[at - 1]} ${head}` : head;
+        let p = brandProducts.get(phrase); if (!p) { p = new Map(); brandProducts.set(phrase, p); }
+        p.set(head, (p.get(head) || 0) + 1);
+        if (two !== head) p.set(two, (p.get(two) || 0) + 1);
+      }
+    }
+  }
   let score = 0;
   if (r.primary) score += 3;
   if (upc) score += 1;
@@ -156,10 +197,54 @@ for await (const r of jsonlGz(path.join(pubDir, srcManifest.file || "items.jsonl
     flags2: bits2, rawPrice: withheld ? Math.round(Number(r.price) * 100) : packListing ? Math.round(Number(r.listing_price) * 100) : 0,
     listingPack: packListing ? Math.min(0xFFFF, Math.round(Number(r.listing_pack))) : 0, valueBasisId: withheld && r.equiv.basis_id != null ? Number(r.equiv.basis_id) : null,
     unit: UNIT[r.unit] || 0, unitName: r.unit || null, pack: Math.min(65535, Number(r.pack) || 1), basis: r.basis === "lb" ? 1 : 0,
-    cat: Number(r.cat) || 0, flags: bits, score, dept: r.dept || "Other",
+    cat: Number(r.cat) || 0, flags: bits, score, dept: r.dept || "Other", inSearch,
   });
 }
-log(`${items.length.toLocaleString()} items parsed`);
+// the brand names typed searches set aside: brands of at least 20 listings, with their main category (0 when none holds half
+// their listings), unless three or more searched names in the consumable departments carry the name as a run of words
+// ("peanut butter" or "olive oil" as a seller's brand are still peanut butter and olive oil; "Blue Tide" pillowcases and
+// Kraft paper notebooks do not make Tide or Kraft product words). Only names that carry their own brand count: Walmart's feed files some other brands' listings under its own
+// ("Great Value | Hunt's Meat Pasta Sauce"), and such a listing, its name starting with another brand's, is that brand's.
+const brandPhrases = {};
+let misfiled = 0;
+const consumableDept = (() => { try { const c = JSON.parse(fs.readFileSync(CATEGORIES_FILE, "utf8")); const set = new Set(c.departments.filter((d) => d.consumable).map((d) => d.name)); return (d) => set.has(d); } catch { return () => true; } })();
+if (SEARCH_SCOPE === "walmart") {
+  const cand = new Map();
+  for (const [ph, m] of brandPhraseCats) {
+    let total = 0, best = 0, cat = 0;
+    for (const [c, n] of m) { total += n; if (n > best) { best = n; cat = c; } }
+    if (total >= 20) cand.set(ph, best / total >= 0.5 ? cat : 0);
+  }
+  const clean = (it) => !brandKey(it.brand) || GENERIC_BRANDS.has(brandKey(it.brand)) || brandKey(it.name).includes(brandKey(it.brand));
+  const used = new Map();
+  for (const it of items) {
+    if (!it.inSearch || !clean(it) || !consumableDept(it.dept)) continue;
+    const t = tokenize(it.name), seen = new Set();
+    for (let i = 0; i < t.length; i++) for (let n = 1; n <= 5 && i + n <= t.length; n++) {
+      const g = t.slice(i, i + n).join(" ");
+      if (!cand.has(g) || seen.has(g)) continue;
+      seen.add(g); used.set(g, (used.get(g) || 0) + 1);
+    }
+  }
+  // each with what it mostly makes: its commonest head noun, with the word before it when two fifths of those listings
+  // say both ("doritos" tortilla chips, "jif" peanut butter, "pampers" diapers); a brand typed alone is searched as that
+  const productOf = (ph) => {
+    const p = brandProducts.get(ph); if (!p) return "";
+    let total = 0; for (const n of brandPhraseCats.get(ph).values()) total += n;
+    const heads = [...p].filter(([k]) => !k.includes(" ")).sort((a, b) => b[1] - a[1]);
+    if (!heads.length || heads[0][1] < 0.2 * total) return "";
+    const h = heads[0][0];
+    const two = [...p].filter(([k]) => k.endsWith(" " + h)).sort((a, b) => b[1] - a[1])[0];
+    return two && two[1] >= 0.4 * heads[0][1] ? two[0] : h;
+  };
+  for (const [ph, cat] of [...cand].sort((a, b) => (a[0] < b[0] ? -1 : 1))) if ((used.get(ph) || 0) < 3) brandPhrases[ph] = [cat, productOf(ph)];
+  for (const it of items) {
+    if (!it.inSearch || clean(it)) continue;
+    const t = tokenize(it.name);
+    for (let n = Math.min(5, t.length); n >= 1; n--) if (brandPhrases[t.slice(0, n).join(" ")]) { it.inSearch = false; misfiled++; break; }
+  }
+}
+log(`${items.length.toLocaleString()} items parsed; search scope ${SEARCH_SCOPE}${SEARCH_SCOPE === "walmart" ? `: ${barcodeOnly.toLocaleString()} barcode lookup only, ${leftOut.toLocaleString()} left out, ${misfiled} filed under a Walmart brand but another brand's` : ""}`);
 
 // ---------------------------------------------------------------- 2. shards: one per department (big ones in parts)
 const SHARD_MAX = Number(arg("shard-max", "600000"));
@@ -283,6 +368,7 @@ function writeShard(sh, si) {
     const post = new Map(), head = new Map();
     for (let i = 0; i < n; i++) {
       if (its[i].flags2 & F2.PLACEHOLDER) continue;            // barcode lookup only: a placeholder name never answers a typed search
+      if (!its[i].inSearch) continue;                          // another brand under the "walmart" search scope: found by its barcode only
       for (const t of uniqueTokens(its[i].brand + " " + its[i].name)) { let a = post.get(t); if (!a) { a = []; post.set(t, a); } a.push(i); }
       const h = headNoun(its[i].name);
       if (h && post.has(h)) { let a = head.get(h); if (!a) { a = []; head.set(h, a); } a.push(i); }
@@ -382,11 +468,18 @@ function pluMatchWords(c) {
   versionFiles.plu = { path: `${version}/plu.json`, bytes: json.length, gzBytes: json.length };
   log(`PLU table: ${priced}/${out.length} codes priced from the snapshot, ${outOfBand} matches outside 0.4-2.5x typical, rest typical`);
 }
+// the other brands' names a typed search sets aside (search scope "walmart" only)
+if (SEARCH_SCOPE === "walmart") {
+  const json = JSON.stringify({ phrases: brandPhrases });
+  fs.writeFileSync(path.join(OUT, version, "brands.json"), json);
+  versionFiles.brands = { path: `${version}/brands.json`, bytes: json.length, gzBytes: Math.round(json.length / 3) };
+  log(`brand names set aside by typed search: ${Object.keys(brandPhrases).length.toLocaleString()}`);
+}
 
 // ---------------------------------------------------------------- 9. manifest + pointer
 // The version names the snapshot plus every file it is made of (and the builder), so new bytes always arrive under a new
 // version; file paths are relative to the db folder.
-const allFiles = [...shardMeta.flatMap((m) => [m.files.cols, ...m.files.strings, m.files.upc, m.files.tokens]), versionFiles.equiv, versionFiles.plu];
+const allFiles = [...shardMeta.flatMap((m) => [m.files.cols, ...m.files.strings, m.files.upc, m.files.tokens]), versionFiles.equiv, versionFiles.plu, ...(versionFiles.brands ? [versionFiles.brands] : [])];
 const manifest = {
   format: "sfb-pack", formatVersion: FORMAT_VERSION, version, snapshot, published: srcManifest.published, built: new Date().toISOString(),
   priceDate: (srcStats.built || srcManifest.published || "").slice(0, 10),
@@ -408,14 +501,14 @@ const manifest = {
       }
       // Walmart's value brands and the generic words of brand-name products: every item is valued at its value-brand
       // equivalent (db-worker valueEquivalent; owner, 2026-10-26)
-      return { brands, prefixes, valueBrands: b.walmart_value_brands || null, genericNames: b.generic_names || null };
-    } catch { return { brands: {}, prefixes: {}, valueBrands: null, genericNames: null }; }
+      return { brands, prefixes, valueBrands: b.walmart_value_brands || null, genericNames: b.generic_names || null, searchScope: SEARCH_SCOPE };
+    } catch { return { brands: {}, prefixes: {}, valueBrands: null, genericNames: null, searchScope: SEARCH_SCOPE }; }
   })(),
   priceCeiling: Math.round(100 * Math.max(Number(catCfg.consumable_rules?.max_price) || 0, Number(catCfg.durable_rules?.max_price) || 0)) || null,
   store: (() => { try { const s = JSON.parse(fs.readFileSync(STORE_FILE, "utf8")); return { id: s.store_id, name: s.name, address: s.address, label: s.label || "Strongsville Walmart" }; } catch { return null; } })(),
   storePriced: items.filter((it) => it.flags2 & F2.STORE_PRICE).length,
   shards: shardMeta,
-  files: { equiv: versionFiles.equiv, plu: versionFiles.plu },
+  files: { equiv: versionFiles.equiv, plu: versionFiles.plu, ...(versionFiles.brands ? { brands: versionFiles.brands } : {}) },
   totalGzBytes: allFiles.reduce((a, f) => a + f.gzBytes, 0),
   coreGzBytes: shardMeta.filter((m) => m.tier === "core").reduce((a, m) => a + m.gzBytes, 0) + versionFiles.equiv.gzBytes + versionFiles.plu.gzBytes,
 };

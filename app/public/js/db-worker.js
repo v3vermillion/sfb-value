@@ -6,7 +6,7 @@
 // core shards can be loaded first and the rest added later (load with `only`). Items are stored in rank order within a
 // shard (best first), so a bitset scan from rank 0 already yields best-first candidates. An item's id across the pack is
 // shard * 2^24 + rank. Format-2 packs load as one shard.
-import { tokenize, joinedTokens, headNoun } from "./tokenize.js";
+import { tokenize, joinedTokens, headNoun, typedSize } from "./tokenize.js";
 
 const td = new TextDecoder();
 const F = { RETIRED: 1, NO_SIZE: 2, PROMO: 4, CARRIED: 8, STORE_BRAND: 16, PRIMARY: 32, SIZE_CONFLICT: 64, UNAVAILABLE: 128 };
@@ -162,7 +162,18 @@ async function load({ base, root, manifest, cacheName, filesCache, only }) {
     const eqFile = manifest.files.equiv;
     const pluFile = manifest.files.plu;
     const eqUrl = manifest.shards ? root + eqFile.path : base + eqFile.path, pluUrl = manifest.shards ? root + pluFile.path : base + pluFile.path;
-    const [eqBuf, plu] = await Promise.all([readVersionFile(eqUrl, cache, false), readVersionFile(pluUrl, cache, true)]);
+    // the other brands' names a typed search sets aside (search scope "walmart"): first word -> [{ toks, cat }], longest first
+    const brUrl = manifest.files.brands ? (manifest.shards ? root : base) + manifest.files.brands.path : null;
+    const [eqBuf, plu, br] = await Promise.all([readVersionFile(eqUrl, cache, false), readVersionFile(pluUrl, cache, true), brUrl ? readVersionFile(brUrl, cache, true).catch(() => null) : null]);
+    d.brandPhrases = new Map(); d.brandWords = new Set();
+    for (const [ph, v] of Object.entries(br?.phrases || {})) {
+      const toks = ph.split(" ");
+      const [cat, product] = Array.isArray(v) ? v : [v, ""];
+      if (!d.brandPhrases.has(toks[0])) d.brandPhrases.set(toks[0], []);
+      d.brandPhrases.get(toks[0]).push({ toks, cat, product, name: ph });
+      for (const t of toks) d.brandWords.add(t);
+    }
+    for (const list of d.brandPhrases.values()) list.sort((a, b) => b.toks.length - a.toks.length);
     tick("equiv"); tick("plu");
     { const r = new Reader(eqBuf); r.magic("SFBE"); const E = r.u32(); d.eqKeys = r.arr(Float64Array, E); d.eqEst = r.arr(Uint32Array, E); d.eqBasis = r.arr(Uint32Array, E);
       d.eqBase = r.arr(Float32Array, E); d.eqPack = r.arr(Uint16Array, E); d.eqUnit = r.arr(Uint8Array, E); d.eqConf = r.arr(Uint8Array, E); d.eqOffs = r.arr(Uint32Array, E + 1); d.eqBytes = r.bytes(d.eqOffs[E]); }
@@ -342,7 +353,7 @@ function gvWords(it, generic = null) {
 function genericNames() {
   if (!db.genericNames) {
     const src = db.manifest?.genericNames || {};
-    db.genericNames = Object.entries(src).map(([k, v]) => ({ toks: tokenize(k), words: [...new Set(tokenize(v).map(sing))] }))
+    db.genericNames = Object.entries(src).map(([k, v]) => ({ name: k, toks: tokenize(k), raw: tokenize(v), words: [...new Set(tokenize(v).map(sing))] }))
       .filter((g) => g.toks.length && g.words.length).sort((a, b) => b.toks.length - a.toks.length);
   }
   return db.genericNames;
@@ -435,6 +446,7 @@ function gvStats() {
   db.gvStats = { key, idf: (cat, w) => Math.log(1 + (n.get(cat) || 1) / (df.get(cat + "|" + w) || 1)) };
   return db.gvStats;
 }
+const FRESH_BRANDS = new Set(["", "unbranded", "fresh produce", "produce", "fresh", "generic", "walmart", "no brand"]);
 const GV_RANK_BONUS = 1.2;    // search: a value-brand item that is what the query names (measured on the gold set: no query lost)
 const GV_MIN_COVER = 0.6;     // at least this share of the value item's own words are in the donated item's name
 const GV_MARGIN = 0.25;       // candidates this close to the best score compete on size
@@ -681,7 +693,8 @@ function otherStoreBrand(tokens) {
   return null;
 }
 
-function scoreCandidates(S, ranks, qTokens, groups, typed = null, ownBrandFirst = false, joined = [], brandHome = 0) {
+function scoreCandidates(S, ranks, qTokens, groups, typed = null, ownBrandFirst = false, joined = [], brandHome = 0, qSize = null) {
+  const walmartScope = db.manifest?.searchScope === "walmart";
   const nums = numberTokens(qTokens);
   const homes = homeCategories(S, groups);
   const scored = ranks.map((r) => {
@@ -721,6 +734,12 @@ function scoreCandidates(S, ranks, qTokens, groups, typed = null, ownBrandFirst 
     if (typed && content.length && content.every((t) => PLAIN_QUALIFIERS.has(t) || typed.some((w, gi) => w.has(t) || (gi === lastG && [...w].some((x) => t.startsWith(x)))))) s += 1.2;
     for (const j of joined) if (tokSet.has(j)) s += 1.5;   // the brand typed as two words: "red pack" is Redpack, not a Red Gold 6 pack
     for (const n of nums) { if ((it.size && Math.abs(it.size - n) < 0.01) || it.pack === n) s += 1.2; }
+    // a size typed with its unit ("green beans 14.5 oz", "butter 1 lb"): the nearer the listing's size, the higher, in any
+    // unit of the same measure (16 oz is 1 lb); nothing at twice or half the size
+    if (qSize && it.size > 0) {
+      const m = MEASURE_OF[it.unit];
+      if (m && m[0] === qSize.dim) s += 1.8 * Math.max(0, 1 - Math.abs(Math.log((it.size * m[1]) / qSize.qty)) / Math.LN2);
+    }
     s -= 0.03 * Math.max(0, toks.length - groups.length);
     // phrase proximity: query words that sit next to each other in the name are the item the volunteer means
     let first = -1, last = -1;
@@ -731,6 +750,14 @@ function scoreCandidates(S, ranks, qTokens, groups, typed = null, ownBrandFirst 
     const headHit = !!head && groups.some((g) => g.some((a) => head === a || (a.length >= 4 && head.startsWith(a))));
     if (headHit) s += 1.6;
     else if (head && toks.length) s -= 0.6;          // the query's words only describe it: a diaper *bag*, a tomato *basket*
+    // a plain word typed ("butter", "milk", "cheese", "beans") is that product, not the one a word before it makes of it
+    // ("peanut butter", "almond milk", "cream cheese", "jelly beans"), unless that word is typed too
+    for (const g of groups) {
+      const mods = COMPOUNDS.get(g[0]);
+      if (!mods) continue;
+      const at = toks.indexOf(g[0]);
+      if (at > 0 && mods.has(toks[at - 1]) && !qTokens.includes(toks[at - 1])) s -= 1.5;
+    }
     // Walmart's own brand is the same price tier as another chain's store brand: first when the query named one, but only
     // for the item the query names, among the consumable departments other chains' store brands compete in ("giant eagle
     // pumpkin" is canned pumpkin, not Mainstays pumpkin plates; owner's food-bank photos, 2026-10-21)
@@ -739,9 +766,13 @@ function scoreCandidates(S, ranks, qTokens, groups, typed = null, ownBrandFirst 
     // oz") shows the value brand's item first when it is the item named, so the volunteer sees the price that counts
     if (it.storeBrand) s += ownBrandFirst && (headHit || exact === groups.length) && S.tier !== "more" ? 3
       : (headHit || exact === groups.length) && S.tier !== "more" && isValueBrand(it) ? GV_RANK_BONUS : 0.3;
+    // unbranded fresh food is valued as it is, like the value brand: the bag of potatoes beside the boxed ones
+    else if (walmartScope && (headHit || exact === groups.length) && S.tier !== "more" && FRESH_BRANDS.has(brandKey(it.brand))) s += GV_RANK_BONUS;
     const aud = AUDIENCE_CATS.get(it.cat);
-    if (aud && !qTokens.some((t) => aud.test(t)) && !namesBrand(groups[0])) s -= 2.5;
+    if (aud && !qTokens.some((t) => aud.test(t)) && !namesBrand(groups[0]) && brandHome !== it.cat) s -= 2.5;   // (a baby brand typed: "huggies wipes")
     if (it.retired) s -= 1.5;
+    // a food word means the food ("milk", "pumpkin"), not a bottle or plates: general merchandise after what is eaten or used up
+    if (walmartScope && (S.tier === "more" || it.cat === 17 || it.cat === 18)) s -= 0.8;
     if (it.unavailable) s -= 0.4;
     s -= (r / S.N) * 0.8;             // rank within the shard as the final tiebreaker
     if (globalThis.SFB_SCORE_DEBUG) it._score = Math.round(s * 100) / 100;
@@ -804,6 +835,14 @@ function brandCategory(altsList) {
   return seen >= 2 && n / seen >= 0.6 ? best : 0;
 }
 
+const COMPOUNDS = new Map(Object.entries({
+  butter: ["peanut", "almond", "apple", "cashew", "sunflower", "cookie", "shea", "cocoa", "body", "nut", "seed", "pumpkin", "hazelnut", "soy"],
+  milk: ["almond", "coconut", "oat", "soy", "rice", "cashew", "condensed", "evaporated", "powdered", "goat", "body", "cleansing"],
+  cheese: ["cream", "cottage", "and", "n"],
+  cream: ["ice", "sour", "shaving", "hand", "face", "body", "eye", "rash", "cortisone", "hydrocortisone", "foot"],
+  beans: ["coffee", "jelly", "espresso", "vanilla"], bean: ["coffee", "jelly", "espresso", "vanilla"],
+  sugar: ["cotton"], oil: ["motor", "baby", "essential", "massage", "hair", "body"],
+}).map(([k, v]) => [k, new Set(v)]));
 // baby food and pet food carry the same flavour words as people food ("roasted chicken rice", "sweet corn"): they rank
 // first only when the query says it is for a baby or a pet, or names the item's brand (owner's food-bank photos 16-20)
 const AUDIENCE_CATS = new Map([[13, /^(baby|babies|infant|toddler|newborn|puree|purees|formula|stage|kids?)$/], [19, /^(dog|dogs|puppy|puppies|cat|cats|kitten|kittens|pet|pets|bird|fish|hamster|kibble|treats?|chews?|litter)$/]]);
@@ -818,8 +857,50 @@ function search(q, limit = 40) {
   const other = otherStoreBrand(tokens);
   let otherBrand = null;
   if (other) { otherBrand = { brand: other.brand, store: other.store }; tokens = [...tokens.slice(0, other.start), ...tokens.slice(other.end)]; }
+  // a brand that is the product's name ("cheerios", "kool aid", "q tips") and has no item of its own in this pack (only
+  // Walmart's brands are searched): the words Walmart's value brand uses for the product (data/brands.json generic_names)
+  let generic = null;
+  const walmartOnly = db.manifest?.searchScope === "walmart";
+  for (const g of genericNames()) {
+    for (let i = 0; i + g.toks.length <= tokens.length; i++) {
+      if (!g.toks.every((x, k) => tokens[i + k] === x) || (!walmartOnly && hasExactToken(g.toks[0]))) continue;
+      const rest = [...tokens.slice(0, i), ...tokens.slice(i + g.toks.length)];
+      tokens = [...tokens.slice(0, i), ...g.raw.filter((w) => !rest.includes(w)), ...tokens.slice(i + g.toks.length)];
+      generic = { name: g.name, words: g.raw.join(" ") };
+      break;
+    }
+    if (generic) break;
+  }
+  // only Walmart's brands are searched: the words of another brand's name ("del monte", "barilla") are set aside before the
+  // search and point it at that brand's aisle; a query of brand words only finds nothing, and says why
+  const brandSetAside = [];
+  let asideCat = 0, asideProduct = "", brandOnly = false;
+  if (walmartOnly && db.brandPhrases?.size) {
+    const keep = [];
+    for (let i = 0; i < tokens.length;) {
+      const run = (db.brandPhrases.get(tokens[i]) || []).find((b) => b.toks.every((x, k) => tokens[i + k] === x));
+      if (run) { brandSetAside.push(run.name); asideCat ||= run.cat; asideProduct ||= run.product; i += run.toks.length; } else keep.push(tokens[i++]);
+    }
+    // a brand alone ("doritos", "tide"): what that brand mostly makes, in Walmart's brands; nothing when that is not known
+    if (!keep.length && !asideProduct) return { query: q, items: [], relaxed: false, dropped: [], setAside: brandSetAside, fuzzy: false, otherBrand, generic, size: null, walmartOnly, brandOnly: true, ms: performance.now() - t0, total: 0 };
+    // (or with only a size, or with words no Walmart item has: "chef boyardee beefaroni" is what Chef Boyardee makes)
+    const said = keep.filter((t) => !/^\d/.test(t) && !typedSize([1, t]) && hasAnyToken(t));
+    if (!said.length && asideProduct) { keep.unshift(...tokenize(asideProduct).filter((t) => !keep.includes(t))); brandOnly = true; }
+    tokens = keep;
+  }
+  // a size typed with its unit ranks the listings by how near their size is (scoreCandidates); among Walmart's brands it
+  // never filters, so "butter 1 lb" also finds the 16 oz box and "green beans 20 oz" the 14.5 and 28 oz cans (every brand
+  // searched: its words must match, as before, and are the first to go when nothing has them all)
+  const qSize = typedSize(tokens);
+  if (qSize && walmartOnly) {
+    const at = qSize.text === "dozen" ? tokens.indexOf("dozen") : tokens.findIndex((t, i) => /^\d/.test(t) && typedSize(tokens.slice(i, i + 3))?.text === qSize.text);
+    const n = qSize.text.split(" ").length;
+    const rest = [...tokens.slice(0, at), ...tokens.slice(at + n)];
+    if (at >= 0 && rest.length) tokens = rest;
+  }
   const shards = db.shards.filter(Boolean);
   let groups = expand(tokens);
+  const dropped = [];
   // two-word names of the same thing: "bath tissue" (Kirkland, Charmin) is what Walmart's own brand calls "toilet paper"
   for (let i = 0; i + 1 < groups.length; i++) {
     const pair = PHRASE_SYN.get(groups[i].src + " " + groups[i + 1].src);
@@ -837,16 +918,17 @@ function search(q, limit = 40) {
   }
   const matches = (g) => g.alts.some((a) => hasAnyToken(a));
   let fuzzy = false, relaxed = false;
-  const dropped = [];
   // typo tolerance: a group that matches nothing in any shard gets one-edit alternatives
   if (groups.some((g) => !matches(g))) {
-    groups = groups.map((g) => (matches(g) || /^\d/.test(g.src) ? g : { ...g, alts: [...g.alts, ...fuzzyAlternatives(g.alts[0])] }));
+    // (another brand's name is not a typo of a Walmart word: "tide" is not "tile")
+    const brandWord = (g) => walmartOnly && db.brandWords?.has(g.src);
+    groups = groups.map((g) => (matches(g) || /^\d/.test(g.src) || brandWord(g) ? g : { ...g, alts: [...g.alts, ...fuzzyAlternatives(g.alts[0])] }));
     fuzzy = groups.some((g) => g.alts.length > 1 && matches(g) && !hasAnyToken(g.src) && !SYN.has(g.src) && !ABBREV[g.src]);   // a typo was actually corrected
   }
   // a word that still matches nothing is dropped and named, so the result is flagged, never silently widened
   let live = [];
   for (const g of groups) { if (matches(g)) live.push(g); else if (!dropped.includes(g.src)) { dropped.push(g.src); relaxed = true; } }
-  if (!live.length) return { query: q, items: [], relaxed: false, dropped, fuzzy, otherBrand, ms: performance.now() - t0, total: 0 };
+  if (!live.length) return { query: q, items: [], relaxed: false, dropped, setAside: brandSetAside, fuzzy, otherBrand, generic, size: qSize, walmartOnly, ms: performance.now() - t0, total: 0 };
   // per shard: the bitset of every live group (null: the word is not in this shard, so nothing here matches all)
   const perShard = shards.map((S) => ({ S, bits: live.map((g) => groupBits(S, g.alts)) }));
   const anyAll = (keep) => perShard.some(({ bits }) => { const bs = bits.filter((_, i) => keep(i)); return bs.every(Boolean) && collect(bs, 1).length > 0; });
@@ -891,7 +973,10 @@ function search(q, limit = 40) {
   }
   // the kind of item the set-aside brand makes ("mission pride fruit mix": Mission Pride is canned fruit, so the canned
   // fruit mix, not a reptile food or a trail mix): the one category holding most of the items branded with every word
-  const brandHome = brandDropped.length ? brandCategory(brandDropped) : 0;
+  let brandHome = brandDropped.length ? brandCategory(brandDropped) : 0;
+  // only Walmart's brands are searched: another brand's name typed with the product ("tide pods", "del monte green beans")
+  // was set aside above, and points at the aisle that brand sells in (<version>/brands.json)
+  if (walmartOnly && !brandHome) brandHome = asideCat;
   // candidates per shard, best rank first: items that ARE what a query word names (head noun) before items that only
   // carry the word, so "bananas" reaches the fresh bananas before a thousand banana-flavoured things
   const CAND = Math.max(limit * 10, 400);
@@ -917,11 +1002,21 @@ function search(q, limit = 40) {
       const seen = new Set(ranks);
       for (const r of collect(bits, cand)) { if (ranks.length >= cand) break; if (!seen.has(r)) ranks.push(r); }
     }
-    scored = scored.concat(scoreCandidates(S, ranks, tokens, alts, typed, !!otherBrand, joined, brandHome));
+    scored = scored.concat(scoreCandidates(S, ranks, tokens, alts, typed, !!otherBrand, joined, brandHome, qSize));
   }
   scored.sort((a, b) => b.s - a.s || a.it.rank - b.it.rank);
   const items = scored.slice(0, limit).map((x) => x.it);
-  return { query: q, items, relaxed, dropped, fuzzy, otherBrand, total, ms: Math.round((performance.now() - t0) * 100) / 100 };
+  // only Walmart's brands are searched: when the best match does not even carry the word that says what the item is (the
+  // last word typed, "ramen" answered with egg noodles through a synonym), Walmart's brands have no such item, and the
+  // results are only the closest ones
+  let missing = null;
+  if (walmartOnly && items.length && !relaxed) {
+    const key = [...live].reverse().find((g) => !/^\d/.test(g.src))?.src;
+    const forms = key ? [key, key + "s", key + "es", key.replace(/e?s$/, ""), key.replace(/ies$/, "y")] : [];
+    const { toks } = itemTokens(items[0].rank, items[0]);
+    if (key && key.length > 2 && !toks.some((t) => forms.includes(t) || (t.length > 4 && t.startsWith(key)))) { missing = key; relaxed = true; }
+  }
+  return { query: q, items, relaxed, dropped, missing, setAside: brandSetAside, brandProduct: brandOnly ? asideProduct : null, fuzzy, otherBrand, generic, size: qSize, walmartOnly, total, ms: Math.round((performance.now() - t0) * 100) / 100 };
 }
 
 // ---------------------------------------------------------------- other sizes
@@ -1004,4 +1099,4 @@ self.onmessage = async (e) => {
 };
 
 // for tools/search-harness.mjs (Node: tests and the gold search set); a module worker ignores exports
-export { load, searchValued as search, lookupUpcValued as lookupUpc, lookupEquivalentValued as lookupEquivalent, lookupPlu, itemValued as item, sizesValued as sizesOf, valueDebug };
+export { load, searchValued as search, lookupUpcValued as lookupUpc, lookupEquivalentValued as lookupEquivalent, lookupPlu, itemValued as item, item as itemRaw, sizesValued as sizesOf, valueDebug };

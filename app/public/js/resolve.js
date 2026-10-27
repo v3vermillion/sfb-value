@@ -111,6 +111,28 @@ export function fromItem(item, { closest = false, query = "", dropped = [], othe
   };
 }
 
+// ---- a size typed with the search ("green beans 20 oz"): an item tapped in another size is priced for the size typed, by
+// the ounce or count (owner, 2026-10-27: the volunteer types the size on the box, and Walmart's brand may not sell it)
+const MEASURE = { oz: ["oz", 1], lb: ["oz", 16], g: ["oz", 0.035274], kg: ["oz", 35.274], "fl oz": ["oz", 1], ml: ["oz", 0.033814],
+  l: ["oz", 33.814], gal: ["oz", 128], qt: ["oz", 32], pt: ["oz", 16], ct: ["ct", 1] };
+/** The resolution with the size typed ({ dim, qty, text } from tokenize.typedSize), when the item is sized in the same
+ * measure, more than 3% off it and within a quarter to four times it; the size typed is then the one priced (useTyped). */
+export function withTypedSize(res, size) {
+  const it = res?.item;
+  if (!size || !it || res.unit === "lb" || res.priceCents == null || !(it.size > 0)) return res;
+  const m = MEASURE[it.unit];
+  if (!m || m[0] !== size.dim) return res;
+  const ratio = size.qty / (it.size * m[1]);
+  if (Math.abs(ratio - 1) <= 0.03 || ratio > 4 || ratio < 0.25) return res;
+  const out = { ...res, typed: { text: size.text, qty: size.qty, per: it.size * m[1] }, useTyped: true };
+  out.unitCents = typedCents(out);
+  return out;
+}
+/** The price of one item of the size typed: the listing's price per ounce or count (one piece of a pack), times that size. */
+export function typedCents(res) {
+  return Math.round((res.priceCents / piecesOf(res.item) / res.typed.per) * res.typed.qty);
+}
+
 /** A resolution of an item with a value-brand equivalent, valued at the equivalent (own = false) or at the item's own
  * Walmart price (own = true). The bundle alternate of a "(N pack)" listing follows: N times the unit's value. */
 export function valueAt(res, item, own) {
@@ -118,6 +140,7 @@ export function valueAt(res, item, own) {
   const cents = own ? g.ownCents : g.cents;
   const out = { ...res, item, gv: g, useOwn: own, priceCents: cents, unitCents: null, packOne: false, packListing: false };
   if (res.listing) out.listing = { ...res.listing, cents: own ? item.listingCents : g.cents * res.listing.n };
+  if (out.typed && out.useTyped) out.unitCents = typedCents(out);
   return out;
 }
 
@@ -274,6 +297,8 @@ export function pruneOwnMatches(learned, max) {
 export function notesFor(res, ctx = {}) {
   const notes = [];
   const it = res.item;
+  if (res.asideBrand) notes.push({ tone: "equiv", text: `${res.asideBrand} is not a Walmart brand. This is Walmart's own version of the item.` });
+  if (res.typed && res.useTyped) notes.push({ tone: "equiv", text: `Priced for ${res.typed.text}, the size typed, from this item's price per ${res.typed.qty && it?.unit === "ct" ? "count" : "ounce"}. Walmart lists it as ${sizeText(it)}.` });
   if (res.gv) {
     const g = res.gv, b = g.basis;
     const per = b?.unit === "ct" ? "count" : "ounce";

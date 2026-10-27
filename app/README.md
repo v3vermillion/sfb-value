@@ -34,6 +34,8 @@ app/
     icon/make_splash.py   the iOS launch images: the page's boot screen rendered at every screen size by icon/render-splash.mjs (Chromium), Floyd-Steinberg dithered to 256 colours
     make-barcode-clip.mjs  a UPC-A .y4m clip for Chromium's fake camera (measure.mjs --video)
     perf-table.mjs   markdown tables of measure/shots results: one browser, or Chromium vs WebKit (app-browsers.yml)
+    gold.mjs         the search gold set against a built pack (data/gold-search.json, or data/gold-search-walmart.json for a pack built with the "walmart" search scope)
+    make-walmart-gold.mjs  data/gold-search-walmart.json from data/gold-search.json (needs a walmart-scope pack and an all-scope pack of the same snapshot)
   tests/             node --test: barcode maths, tokenizer, resolution engine, staleness thresholds, storage persistence policy,
                      perf comparison flags
   wrangler.toml      assets-only Worker config

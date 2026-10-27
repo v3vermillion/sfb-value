@@ -3,7 +3,7 @@
 
 import { DbClient } from "./db-client.js";
 import { classifyCode, formatGtin } from "./barcode.js";
-import { resolveCode, fromItem, valueAt, kindLabel, titleOf, splitTitle, sizeText, piecesOf, countText, fmtNum, notesFor, livePlausible, packListingOf, liveUnitCents, whoseBrand, mergeLearned, pruneOwnMatches, liveCheckable } from "./resolve.js";
+import { resolveCode, fromItem, valueAt, withTypedSize, typedCents, kindLabel, titleOf, splitTitle, sizeText, piecesOf, countText, fmtNum, notesFor, livePlausible, packListingOf, liveUnitCents, whoseBrand, mergeLearned, pruneOwnMatches, liveCheckable } from "./resolve.js";
 import { tokenize } from "./tokenize.js";
 import { stalenessLevel, stalenessText, ageText, daysSince } from "./staleness.js";
 
@@ -868,7 +868,10 @@ function renderResults(res, code, q) {
   let html = showCode ? codeRowHtml(code) : "";
   const first = res.items.slice(0, FIRST_ROWS), rest = res.items.slice(FIRST_ROWS);
   for (const it of first) html += rowHtml(it, toks);
-  if (!html) html = `<li class="empty"><p>No results for <b>${esc(q)}</b>. Try fewer words or the brand name, or scan the barcode.</p><button class="btn btn--ghost" type="button" data-act="scan">${icon("scan")}<span>Scan the barcode</span></button></li>`;
+  if (!html) html = res.brandOnly
+    // only Walmart's brands are searched, and the query named another brand only
+    ? `<li class="empty"><p><b>${esc(titleWords(res.setAside?.[0] || q))}</b> is not a Walmart brand. Type what the item is and its size, like <b>green beans 14.5 oz</b>, or scan the barcode.</p><button class="btn btn--ghost" type="button" data-act="scan">${icon("scan")}<span>Scan the barcode</span></button></li>`
+    : `<li class="empty"><p>No results for <b>${esc(q)}</b>. ${res.walmartOnly ? "Type what the item is and its size" : "Try fewer words or the brand name"}, or scan the barcode.</p><button class="btn btn--ghost" type="button" data-act="scan">${icon("scan")}<span>Scan the barcode</span></button></li>`;
   el.list.innerHTML = html;
   cancelMore();
   if (rest.length) {
@@ -884,6 +887,7 @@ function renderResults(res, code, q) {
     if (res.fuzzy) meta += " · spelling corrected";
     if (res.relaxed) meta = `<span class="warn">Closest matches</span>${res.dropped?.length ? ` · “${esc(res.dropped.join(" "))}” not found` : " · no item has every word"}`;
     if (res.otherBrand) meta = `<span class="warn">${esc(res.otherBrand.brand)} is ${esc(whoseBrand(res.otherBrand))}, not sold at Walmart</span> · Walmart's own brand first${res.dropped?.length ? ` · “${esc(res.dropped.join(" "))}” not found` : ""}`;
+    if (res.walmartOnly) meta = walmartMeta(res, meta);
   }
   el.resultsMeta.innerHTML = meta;
   // the list says "No results" on screen; the announcement says it too
@@ -895,6 +899,20 @@ function renderResults(res, code, q) {
   if (entering) { el.list.classList.add("is-entering"); clearTimeout(state.enterTimer); state.enterTimer = setTimeout(() => el.list.classList.remove("is-entering"), 600); }
 }
 
+/** The results line when only Walmart's brands are searched (data/brands.json search_scope): another brand typed is named
+ * and set aside, a brand-name product shows Walmart's own, a product Walmart's brands do not make says so, and a size typed
+ * says the nearest sizes come first. */
+function walmartMeta(res, meta) {
+  const aside = res.setAside?.length ? titleWords(res.setAside[0]) : null;
+  let m = `<b>${fmtInt(res.total)}</b> Walmart-brand ${res.total === 1 ? "match" : "matches"}`;
+  if (res.missing) m = `<span class="warn">No Walmart-brand “${esc(res.missing)}”</span> · closest items`;
+  else if (res.relaxed && res.dropped?.length) m = `<span class="warn">Closest matches</span> · “${esc(res.dropped.join(" "))}” not found`;
+  if (aside) m = `<span class="warn">${esc(aside)} is not a Walmart brand</span> · ${res.brandProduct ? `Walmart's ${esc(res.brandProduct)}` : "Walmart's own"}${res.missing ? ` · no Walmart-brand “${esc(res.missing)}”` : ""}`;
+  else if (res.generic && !res.missing) m = `Walmart's own ${esc(res.generic.words)} for ${esc(titleWords(res.generic.name))}`;
+  if (res.otherBrand) m = meta;
+  if (res.size) m += ` · nearest ${esc(res.size.text)} first`;
+  return m;
+}
 /** The result count is announced once typing pauses, not on every keystroke. */
 let resultsLiveTimer = 0, resultsLiveText = "";
 function announceResults(text) {
@@ -911,8 +929,12 @@ el.list.addEventListener("click", (e) => {
 async function openRank(rank, { closest = false, source = "search" } = {}) {
   const item = await db.item(rank);
   if (!item) return;
-  openResolution(fromItem(item, { closest, query: state.query, dropped: state.last?.dropped || [], otherBrand: state.last?.otherBrand || null }), { source });
+  let res = fromItem(item, { closest, query: state.query, dropped: state.last?.dropped || [], otherBrand: state.last?.otherBrand || null });
+  // another brand typed and set aside (only Walmart's brands are searched): the sheet says the item is Walmart's version
+  if (state.last?.setAside?.length && !item.gv) res = { ...res, asideBrand: titleWords(state.last.setAside[0]) };
+  openResolution(withTypedSize(res, state.last?.size), { source });
 }
+const titleWords = (s) => String(s).replace(/(^|\s)([a-z])/g, (m, a, b) => a + b.toUpperCase());
 async function openCode(raw, { source = "typed", format, scanned = false, preferId = null } = {}) {
   state.learnFor = null;
   const res = await resolveWithPending(raw, format, resolveOpts({ scanned, preferId }), () => toast("Other departments are still loading…", { iconName: "refresh", ms: 2500 }));
@@ -931,6 +953,7 @@ function basisText(res) {
   if (res.priceCents == null) return "";
   if (res.unit === "lb") return "per lb";
   if (res.kind === "store-label") return "on the label";
+  if (res.typed && res.useTyped) return `for ${res.typed.text}`;
   if (res.listing) return res.unitCents === res.listing.cents ? `pack of ${res.listing.n}` : "each";
   const n = piecesOf(it);
   return n > 1 ? (res.unitCents != null && res.unitCents !== res.priceCents ? `1 of ${n}` : "whole pack") : "each";
@@ -972,7 +995,11 @@ function sheetHtml(res) {
 
   // a loose single from a multipack is an exact item too: let the volunteer price one of the pack; an item Walmart
   // lists only as a "(N pack)" bundle is priced as one unit, with the bundle's own price as the alternate
-  const packSeg = res.listing && res.priceCents != null
+  // a size typed with the search and the item listed in another: priced for the size typed, or as listed
+  const typedSeg = res.typed && res.priceCents != null
+    ? `<div class="seg value-seg typed-seg" role="group" aria-label="Price for"><button type="button" data-typed="typed" aria-pressed="${!!res.useTyped}">${esc(res.typed.text)} · ${money(typedCents(res))}</button><button type="button" data-typed="listed" aria-pressed="${!res.useTyped}">${esc(sizeText(it) || "As listed")} · ${money(res.priceCents)}</button></div>`
+    : "";
+  const packSeg = res.useTyped ? "" : res.listing && res.priceCents != null
     ? `<div class="seg pack-seg" role="group" aria-label="Price one item or the whole pack"><button type="button" data-pack="unit" data-cents="${res.priceCents}" aria-pressed="${res.unitCents == null || res.unitCents === res.priceCents}">One · ${money(res.priceCents)}</button><button type="button" data-pack="listing" data-cents="${res.listing.cents}" aria-pressed="${res.unitCents === res.listing.cents}">Pack of ${res.listing.n} · ${money(res.listing.cents)}</button></div>`
     : it && piecesOf(it) > 1 && res.unit !== "lb" && res.priceCents != null
     ? `<div class="seg pack-seg" role="group" aria-label="Price the whole pack or one item"><button type="button" data-pack="whole" data-cents="${res.priceCents}" aria-pressed="${res.unitCents == null || res.unitCents === res.priceCents}">Whole pack · ${money(res.priceCents)}</button><button type="button" data-pack="one" data-cents="${Math.round(res.priceCents / piecesOf(it))}" aria-pressed="${res.unitCents != null && res.unitCents !== res.priceCents}">1 of ${piecesOf(it)} · ${money(Math.round(res.priceCents / piecesOf(it)))}</button></div>`
@@ -1031,6 +1058,7 @@ function sheetHtml(res) {
     ${liveRow}
     </div><div class="sheet-side">
     ${valueSeg}
+    ${typedSeg}
     ${packSeg}
     ${stepper}
     <div class="actions">${primary}${secondary}${again}</div>
@@ -1105,6 +1133,17 @@ function wireSheet(dlg, res) {
     const v = dlg.querySelector("#qtyVal"); if (v) v.textContent = res.unit === "lb" ? fmtNum(state.qty) : String(state.qty);
     const small = v?.nextElementSibling; if (small && res.unit !== "lb") small.textContent = state.qty === 1 ? "item" : "items";
     refreshPrice(dlg, res);
+    haptic(5);
+  }));
+  dlg.querySelectorAll("[data-typed]").forEach((b) => b.addEventListener("click", () => {
+    const typed = b.dataset.typed === "typed";
+    if (typed === !!res.useTyped) return;
+    const next = { ...res, useTyped: typed, packOne: false, packListing: false, unitCents: typed ? typedCents(res) : null };
+    state.sheetRes = next;
+    const y = dlg.querySelector(".sheet-inner")?.scrollTop || 0;
+    rerenderSheet(next);
+    dlg.querySelector(".sheet-inner").scrollTop = y;
+    dlg.querySelector(`[data-typed="${typed ? "typed" : "listed"}"]`)?.focus({ preventScroll: true });
     haptic(5);
   }));
   dlg.querySelectorAll("[data-value]").forEach((b) => b.addEventListener("click", () => {
@@ -1256,7 +1295,7 @@ function saveTally() { writeJson(TALLY_KEY, tally); renderTallyPill(); }
 function addToTally(res) {
   const cents = lineTotal(res);
   const base = res.kind === "exact" || res.kind === "closest" ? titleOf(res.item) : res.title;
-  const title = res.packOne && piecesOf(res.item) > 1 ? `${base} (1 of ${piecesOf(res.item)})` : res.packListing && res.listing ? `${base} (pack of ${res.listing.n})` : base;
+  const title = res.typed && res.useTyped ? `${base} (priced for ${res.typed.text})` : res.packOne && piecesOf(res.item) > 1 ? `${base} (1 of ${piecesOf(res.item)})` : res.packListing && res.listing ? `${base} (pack of ${res.listing.n})` : base;
   const line = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, title, unitCents: unitCents(res), qty: state.qty, unit: res.unit, kind: res.kind, cents, at: Date.now(), key: res.key,
     ...(res.gv && !res.useOwn ? { gv: res.gv.brand } : {}), ...(db.manifest?.fixture ? { sample: true } : {}) };
   tally.push(line);

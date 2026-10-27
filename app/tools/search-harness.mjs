@@ -32,5 +32,5 @@ export async function openPack(dbDir) {
   const stats = await worker.load({ root: "pack:", base: `pack:${current.base}`, manifest, cacheName: null });
   // every item of the pack in order (gold.mjs coverage): ids are shard * 2^24 + rank
   const ids = function* () { for (const sh of manifest.shards || [{ items: manifest.items }]) { const si = (manifest.shards || [sh]).indexOf(sh); for (let r = 0; r < sh.items; r++) yield si * 16777216 + r; } };
-  return { manifest, stats, ids, search: (q, limit) => worker.search(q, limit), lookupUpc: (k) => worker.lookupUpc(k), lookupEquivalent: (k) => worker.lookupEquivalent(k), item: (r) => worker.item(r), sizes: (r, n) => worker.sizesOf(r, n), valueDebug: (r) => worker.valueDebug(r) };
+  return { manifest, stats, ids, search: (q, limit) => worker.search(q, limit), lookupUpc: (k) => worker.lookupUpc(k), lookupEquivalent: (k) => worker.lookupEquivalent(k), item: (r) => worker.item(r), itemRaw: (r) => worker.itemRaw(r), sizes: (r, n) => worker.sizesOf(r, n), valueDebug: (r) => worker.valueDebug(r) };
 }
