@@ -188,7 +188,8 @@ jobs:
         if: steps.peek.outputs.skip != 'true'
         run: node --max-old-space-size=6144 tools/build-db.mjs --store "${{ steps.data.outputs.store }}" --out dist/db
 
-      # Search quality on the real pack (data/gold-search.json, 351 everyday donations): below 95% opens [search-gold],
+      # Search quality on the real pack (data/gold-search.json, 351 everyday donations; data/gold-search-walmart.json when the
+      # pack searches Walmart's brands only, data/brands.json search_scope): below 95% opens [search-gold],
       # below 90% fails here so the live site keeps the previous build. Not run on the synthetic fixture.
       - name: Search gold set
         id: gold
@@ -308,7 +309,7 @@ jobs:
           mode: open
           title: "search: ${{ steps.gold.outputs.passed }}/${{ steps.gold.outputs.total }} gold queries find the right item"
           body: |
-            The search gold set (data/gold-search.json) found the right item in the top 3 for ${{ steps.gold.outputs.passed }}
+            The search gold set (data/gold-search.json, or data/gold-search-walmart.json for a Walmart-brands-only pack) found the right item in the top 3 for ${{ steps.gold.outputs.passed }}
             of ${{ steps.gold.outputs.total }} queries (rate ${{ steps.gold.outputs.rate }}). The run summary lists every miss.
             ${{ steps.gold.outputs.below_block == 'true' && 'Below 90%: this build was NOT deployed; the previous one stays live.' || 'The build was deployed.' }}
             Fix the ranking (app/public/js/db-worker.js) or a wrong expectation in the gold set, then re-run deploy-app.

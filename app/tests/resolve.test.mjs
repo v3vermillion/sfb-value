@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveCode, fromItem, kindLabel, splitTitle, titleOf, notesFor, livePlausible, packListingOf, liveUnitCents, storeOfCode, whoseBrand, mergeLearned, pruneOwnMatches, liveCheckable } from "../public/js/resolve.js";
+import { resolveCode, fromItem, valueAt, kindLabel, splitTitle, titleOf, notesFor, livePlausible, packListingOf, liveUnitCents, storeOfCode, whoseBrand, mergeLearned, pruneOwnMatches, liveCheckable } from "../public/js/resolve.js";
 
 const corn = { rank: 0, id: 1, brand: "Great Value", name: "Great Value Golden Sweet Whole Kernel Corn, Canned Corn, 15.25 oz Can", priceCents: 87, size: 15.25, unit: "oz", pack: 1, basis: "each", cat: 6, catName: "Canned & Jarred", upc: "00078742054261", retired: false, primary: true, storeBrand: true };
 const retired = { ...corn, rank: 1, id: 2, retired: true, primary: false };
@@ -301,4 +301,42 @@ test("the phone keeps its own newest matches; shared ones never push them out (a
   assert.equal(Object.values(kept).filter((m) => !m.shared).length, 500, "own matches are capped at 500");
   assert.ok(!kept["10000000000000"] && !kept["10000000000002"] && kept["10000000000003"], "the oldest own matches go first");
   assert.ok(kept["90000000000001"], "a shared match is left alone");
+});
+
+// ---- every item valued at Walmart's value brand (owner, 2026-10-26): the worker attaches item.gv
+const gvRigatoni = { ...corn, rank: 70, id: 70, brand: "Great Value", name: "Great Value Rigatoni, 16 oz", priceCents: 136, size: 16, cat: 7, upc: "00078742000001" };
+const barilla = { ...corn, rank: 71, id: 71, brand: "Barilla", name: "Barilla Classic Rigatoni Pasta, 16 oz", priceCents: 188, size: 16, cat: 7, storeBrand: false, upc: "00076808000001",
+  gv: { cents: 136, ownCents: 188, brand: "Great Value", basis: gvRigatoni, scaled: false, confidence: "high" } };
+test("an item with a value-brand equivalent is valued at it, and its own price is one choice away", () => {
+  const r = fromItem(barilla);
+  assert.equal(r.kind, "exact"); assert.equal(r.priceCents, 136); assert.equal(r.gv.brand, "Great Value");
+  assert.match(notesFor(r)[0].text, /Valued at its Great Value equivalent, Great Value Rigatoni, 16 oz\. This brand's own Walmart price is \$1\.88/);
+  const own = valueAt(r, r.item, true);
+  assert.equal(own.priceCents, 188); assert.equal(own.useOwn, true);
+  assert.match(notesFor(own)[0].text, /own Walmart price, as chosen.*would be \$1\.36/);
+  assert.equal(valueAt(own, own.item, false).priceCents, 136, "and back");
+  const scaled = fromItem({ ...barilla, gv: { ...barilla.gv, cents: 102, scaled: true } });
+  assert.match(notesFor(scaled)[0].text, /priced by the ounce for this item's size/);
+});
+
+test("a bundle listing's alternate follows the value: N times the unit's equivalent", () => {
+  const unit = { ...barilla, packListing: true, listingCents: 1128, listingPack: 6 };
+  const r = fromItem(unit);
+  assert.deepEqual(r.listing, { cents: 136 * 6, n: 6 });
+  assert.deepEqual(valueAt(r, unit, true).listing, { cents: 1128, n: 6 });
+});
+
+test("an item with no value-brand equivalent keeps its own price and says why", () => {
+  const r = fromItem({ ...barilla, gv: undefined, gvNone: true });
+  assert.equal(r.priceCents, 188);
+  assert.match(notesFor(r)[0].text, /no close equivalent under its own value brands/);
+});
+
+test("a barcode Walmart does not sell moves to the value-brand level of the item it was valued from", async () => {
+  const basis = { ...barilla, priceCents: 200, gv: { ...barilla.gv, cents: 120, ownCents: 200 } };
+  const db = { async lookupUpc(key) { return key === 4099100000000 ? { items: [], equivalent: { brand: "Mueller's", name: "Rigatoni", quantity: "16 oz", estCents: 180, confidence: "high", basis } } : { items: [], equivalent: null }; } };
+  const r = await resolveCode(db, "4099100000000");
+  assert.equal(r.kind, "equivalent"); assert.equal(r.priceCents, Math.round((180 * 120) / 200)); assert.equal(r.gv.viaBasis, true);
+  const tier = { async lookupUpc() { return { items: [], equivalent: { brand: "Clancy's", name: "Rigatoni", quantity: "16 oz", estCents: 90, confidence: "high", basis, storeTier: true } }; } };
+  assert.equal((await resolveCode(tier, "4099100000000")).priceCents, 90, "another chain's store brand is already at that level");
 });

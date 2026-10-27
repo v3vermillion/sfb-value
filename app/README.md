@@ -34,6 +34,8 @@ app/
     icon/make_splash.py   the iOS launch images: the page's boot screen rendered at every screen size by icon/render-splash.mjs (Chromium), Floyd-Steinberg dithered to 256 colours
     make-barcode-clip.mjs  a UPC-A .y4m clip for Chromium's fake camera (measure.mjs --video)
     perf-table.mjs   markdown tables of measure/shots results: one browser, or Chromium vs WebKit (app-browsers.yml)
+    gold.mjs         the search gold set against a built pack (data/gold-search.json, or data/gold-search-walmart.json for a pack built with the "walmart" search scope)
+    make-walmart-gold.mjs  data/gold-search-walmart.json from data/gold-search.json (needs a walmart-scope pack and an all-scope pack of the same snapshot)
   tests/             node --test: barcode maths, tokenizer, resolution engine, staleness thresholds, storage persistence policy,
                      perf comparison flags
   wrangler.toml      assets-only Worker config
@@ -53,6 +55,7 @@ quantity or weight stepper, and **Add to tally**. The sheet's coloured label nam
 | label | when | what is shown |
 |---|---|---|
 | Exact item | barcode or chosen search hit found in the snapshot (incl. retired UPCs, "older barcode") | item, price, "1 of N" for a pack or a box counted in its name, other listings for the same barcode, the product's other sizes and counts |
+| (any of these) valued at its Great Value equivalent | a name-brand item whose value-brand version the worker finds (`valueEquivalent`; docs/DECISIONS.md 2026-10-27) | the value price ("Great Value equivalent"), the value item it came from (tappable), the brand's own Walmart price, and a switch to value the item at that own price instead; rows show "Great Value price" |
 | Store price label | barcode starting with 2 (scale labels: meat, deli, bakery) | price decoded from the barcode, GS1 verifier checked |
 | Produce code | 4-digit PLU (and 9xxxx organic) | produce name, price per lb or each, weight stepper |
 | Equivalent value | barcode Walmart doesn't sell, present in the equivalents table | estimated price, confidence, the Walmart basis item (tappable) |
